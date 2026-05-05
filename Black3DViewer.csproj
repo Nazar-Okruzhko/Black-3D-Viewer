@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ 
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>7.3</LangVersion>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <ApplicationIcon>1.ico</ApplicationIcon>
+    <AssemblyName>Black3DViewer</AssemblyName>
+    <RootNamespace>Viewer3D</RootNamespace>
+  </PropertyGroup>
+ 
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+ 
+  <ItemGroup>
+    <PackageReference Include="OpenTK" Version="3.3.3" />
+    <PackageReference Include="OpenTK.GLControl" Version="3.3.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="1.ico" />
+  </ItemGroup>
+ 
+</Project>
+ 
