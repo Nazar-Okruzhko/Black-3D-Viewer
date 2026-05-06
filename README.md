@@ -1,1 +1,3 @@
-# Hot-Dog - The 3D Viewer [BETA]
+# Project Hot-Dog: Reborn - Black 3D Viewer
+
+# W.I.P. Project => Project is under a lot of the digging....
