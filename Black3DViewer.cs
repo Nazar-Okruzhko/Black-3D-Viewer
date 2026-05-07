@@ -181,6 +181,8 @@ void main() { FragColor = vec4(color, 1.0); }
         }
  
         public void SetInt(string n, int v)          => GL.Uniform1(Loc(n), v);
+        public void SetFloat(string n, float v)      => GL.Uniform1(Loc(n), v);
+        public void SetVec2(string n, Vector2 v)     => GL.Uniform2(Loc(n), v.X, v.Y);
         public void SetVec3(string n, Vector3 v)     => GL.Uniform3(Loc(n), v);
         public void SetMat4(string n, ref Matrix4 m) => GL.UniformMatrix4(Loc(n), false, ref m);
     }
@@ -218,8 +220,9 @@ void main() { FragColor = vec4(color, 1.0); }
         public int ColorMapId = -1, NormalMapId = -1, SpecularMapId = -1;
         public int MetallicMapId = -1, RoughnessMapId = -1, OpacityMapId = -1;
  
-        // Path to the color texture (kept for UI preview)
-        public string ColorMapPath = null;
+        // Texture paths for all 6 slots (export + file-watching)
+        public string[] TexPaths = new string[6];
+        public string ColorMapPath => TexPaths[0];  // read-only alias
  
         // GPU handles
         public int VAO, VBO, EBO;
@@ -244,7 +247,18 @@ void main() { FragColor = vec4(color, 1.0); }
                     case ".obj": (v, uv, n, f, bMin, bMax) = ObjLoader.Load(path); break;
                     case ".csv": (v, uv, n, f, bMin, bMax) = CsvLoader.Load(path); break;
                     case ".stl": (v, uv, n, f, bMin, bMax) = StlLoader.Load(path); break;
-                    case ".rip": (v, uv, n, f, bMin, bMax) = NR1Loader.Load(path); break;
+                    case ".rip":
+                        // Ask user for field offsets via popup
+                        int ripPos = 0, ripUv = -1;
+                        if (RipFieldsSelector != null)
+                        {
+                            var ans = RipFieldsSelector(path);
+                            if (!ans.HasValue) return; // user cancelled
+                            ripPos = ans.Value.posOff;
+                            ripUv  = ans.Value.uvOff;
+                        }
+                        (v, uv, n, f, bMin, bMax) = NR1Loader.Load(path, ripPos, ripUv);
+                        break;
                     case ".nr":  (v, uv, n, f, bMin, bMax) = NR2Loader.Load(path); break;
                     case ".glb": (v, uv, n, f, bMin, bMax) = GlbLoader.Load(path); break;
                     case ".dae": (v, uv, n, f, bMin, bMax) = DaeLoader.Load(path); break;
@@ -285,6 +299,21 @@ void main() { FragColor = vec4(color, 1.0); }
                 default: return false;
             }
         }
+ 
+        public int GetTexId(int slot)
+        {
+            switch (slot)
+            {
+                case 0: return ColorMapId;     case 1: return NormalMapId;
+                case 2: return SpecularMapId;  case 3: return RoughnessMapId;
+                case 4: return MetallicMapId;  case 5: return OpacityMapId;
+                default: return -1;
+            }
+        }
+ 
+        // Prompt shown before loading .rip files; set by Viewer3DForm on startup.
+        // Returns (posByteOffset, uvByteOffset) or null to cancel.
+        public static Func<string, (int posOff, int uvOff)?> RipFieldsSelector = null;
  
         // -- Normal recalculation (smooth) -------------------------------------
         public void RecalcNormals()
@@ -403,11 +432,11 @@ void main() { FragColor = vec4(color, 1.0); }
                 string texFile = p[p.Length - 1]; // last token = filename (handles -bm flag)
                 string tp = Path.Combine(dir, texFile);
                 if (!File.Exists(tp)) continue;
-                if      (p[0] == "map_Kd")                         { ColorMapId    = LoadTex(tp); ColorMapPath = tp; }
-                else if (p[0] == "map_Bump" || p[0] == "bump")    NormalMapId   = LoadTex(tp);
-                else if (p[0] == "map_Ks")                         SpecularMapId = LoadTex(tp);
-                else if (p[0] == "map_Pm")                         MetallicMapId = LoadTex(tp);
-                else if (p[0] == "map_Pr" || p[0] == "map_Ns")    RoughnessMapId= LoadTex(tp);
+                if      (p[0] == "map_Kd")                         { ColorMapId    = LoadTex(tp); TexPaths[0] = tp; }
+                else if (p[0] == "map_Bump" || p[0] == "bump")    { NormalMapId   = LoadTex(tp); TexPaths[1] = tp; }
+                else if (p[0] == "map_Ks")                         { SpecularMapId = LoadTex(tp); TexPaths[2] = tp; }
+                else if (p[0] == "map_Pm")                         { MetallicMapId = LoadTex(tp); TexPaths[4] = tp; }
+                else if (p[0] == "map_Pr" || p[0] == "map_Ns")    { RoughnessMapId= LoadTex(tp); TexPaths[3] = tp; }
                 else if (p[0] == "map_d")                          OpacityMapId  = LoadTex(tp);
             }
         }
@@ -419,7 +448,7 @@ void main() { FragColor = vec4(color, 1.0); }
             foreach (var ext in new[] { ".png", ".jpg", ".jpeg", ".bmp", ".dds", ".tga" })
             {
                 string tp = Path.Combine(dir, name + ext);
-                if (File.Exists(tp)) { ColorMapId = LoadTex(tp); ColorMapPath = tp; return; }
+                if (File.Exists(tp)) { ColorMapId = LoadTex(tp); TexPaths[0] = tp; return; }
             }
         }
  
@@ -428,10 +457,14 @@ void main() { FragColor = vec4(color, 1.0); }
             int id = LoadTex(path); if (id < 0) return;
             switch (slot)
             {
-                case 0: ColorMapId = id; ColorMapPath = path; break;    case 1: NormalMapId = id; break;
-                case 2: SpecularMapId = id; break; case 3: RoughnessMapId = id; break;
-                case 4: MetallicMapId = id; break; case 5: OpacityMapId = id; break;
+                case 0: ColorMapId    = id; break;
+                case 1: NormalMapId   = id; break;
+                case 2: SpecularMapId = id; break;
+                case 3: RoughnessMapId= id; break;
+                case 4: MetallicMapId = id; break;
+                case 5: OpacityMapId  = id; break;
             }
+            if (slot >= 0 && slot < 6) TexPaths[slot] = path;
         }
  
         private int LoadTex(string path)
@@ -465,24 +498,126 @@ void main() { FragColor = vec4(color, 1.0); }
             catch { return -1; }
         }
  
+        public  Bitmap LoadDDSPublic(string path) => LoadDDS(path);
+        public  Bitmap LoadTGAPublic(string path)  => LoadTGA(path);
         private Bitmap LoadDDS(string path)
         {
             try
             {
                 using (var br = new BinaryReader(File.OpenRead(path)))
                 {
-                    if (br.ReadUInt32() != 0x20534444) return null;
-                    br.ReadBytes(4);
-                    int h = br.ReadInt32(), w = br.ReadInt32();
-                    br.ReadBytes(108 - 16);
-                    var px  = br.ReadBytes(w * h * 4);
-                    var bmp = new Bitmap(w, h);
-                    for (int y = 0; y < h; y++)
-                        for (int x = 0; x < w; x++)
+                    // Full 128-byte DDS header
+                    if (br.ReadUInt32() != 0x20534444u) return null; // magic "DDS "
+                    br.ReadBytes(4);                     // dwSize
+                    br.ReadBytes(4);                     // dwFlags
+                    int height = br.ReadInt32();         // dwHeight (offset 12)
+                    int width  = br.ReadInt32();         // dwWidth  (offset 16)
+                    br.ReadBytes(4);                     // dwPitchOrLinearSize
+                    br.ReadBytes(4);                     // dwDepth
+                    br.ReadBytes(4);                     // dwMipMapCount
+                    br.ReadBytes(44);                    // dwReserved1[11]
+                    br.ReadBytes(4);                     // ddspf.dwSize
+                    uint pfFlags = br.ReadUInt32();      // ddspf.dwFlags (offset 80)
+                    uint fourCC  = br.ReadUInt32();      // ddspf.dwFourCC (offset 84)
+                    br.ReadBytes(20);                    // rest of ddspf: RGBBitCount + 4 masks
+                    br.ReadBytes(20);                    // dwCaps[4] + dwReserved2 => now at byte 128
+                    // Now at offset 128 == first pixel byte
+ 
+                    const uint DXT1 = 0x31545844u, DXT3 = 0x33545844u, DXT5 = 0x35545844u;
+                    bool compressed = (pfFlags & 0x4u) != 0;
+                    int w = width, h = height;
+                    var pixels = new byte[w * h * 4]; // BGRA output
+ 
+                    if (compressed && (fourCC == DXT1 || fourCC == DXT3 || fourCC == DXT5))
+                    {
+                        int blkBytes = (fourCC == DXT1) ? 8 : 16;
+                        int bw = Math.Max(1, (w+3)/4), bh = Math.Max(1, (h+3)/4);
+ 
+                        for (int by = 0; by < bh; by++)
+                        for (int bx = 0; bx < bw; bx++)
                         {
-                            int i = (y * w + x) * 4;
-                            bmp.SetPixel(x, y, Color.FromArgb(px[i+3], px[i+2], px[i+1], px[i]));
+                            byte[] blk = br.ReadBytes(blkBytes);
+                            int ao = (fourCC == DXT1) ? 0 : 8; // colour-block offset
+ 
+                            // DXT5 alpha block
+                            long aBits = 0; byte a0 = 255, a1 = 255;
+                            if (fourCC == DXT5)
+                            {
+                                a0 = blk[0]; a1 = blk[1];
+                                aBits = (long)blk[2]        | ((long)blk[3] << 8)  |
+                                        ((long)blk[4] << 16)| ((long)blk[5] << 24) |
+                                        ((long)blk[6] << 32)| ((long)blk[7] << 40);
+                            }
+ 
+                            // Decode two 16-bit RGB565 endpoint colours
+                            ushort c0 = (ushort)(blk[ao]   | (blk[ao+1]<<8));
+                            ushort c1 = (ushort)(blk[ao+2] | (blk[ao+3]<<8));
+                            uint   ci = (uint)  (blk[ao+4] | (blk[ao+5]<<8) | (blk[ao+6]<<16) | (blk[ao+7]<<24));
+ 
+                            int r0=(c0>>11&31)*255/31, g0=(c0>>5&63)*255/63, b0=(c0&31)*255/31;
+                            int r1=(c1>>11&31)*255/31, g1=(c1>>5&63)*255/63, b1=(c1&31)*255/31;
+ 
+                            int[] cr=new int[4], cg=new int[4], cb=new int[4], ca=new int[]{255,255,255,255};
+                            cr[0]=r0; cg[0]=g0; cb[0]=b0;
+                            cr[1]=r1; cg[1]=g1; cb[1]=b1;
+                            if (fourCC != DXT1 || c0 > c1)
+                            {
+                                cr[2]=(2*r0+r1)/3; cg[2]=(2*g0+g1)/3; cb[2]=(2*b0+b1)/3;
+                                cr[3]=(r0+2*r1)/3; cg[3]=(g0+2*g1)/3; cb[3]=(b0+2*b1)/3;
+                                if (fourCC == DXT1) ca[3] = 0;
+                            }
+                            else
+                            {
+                                cr[2]=(r0+r1)/2; cg[2]=(g0+g1)/2; cb[2]=(b0+b1)/2;
+                                cr[3]=0; cg[3]=0; cb[3]=0; ca[3]=0;
+                            }
+ 
+                            for (int py = 0; py < 4; py++)
+                            for (int px = 0; px < 4; px++)
+                            {
+                                int px2=bx*4+px, py2=by*4+py;
+                                if (px2>=w||py2>=h) continue;
+                                int pi=(py2*w+px2)*4;
+                                int ii=(int)((ci>>(2*(py*4+px)))&3);
+                                pixels[pi  ]=(byte)cb[ii]; // B
+                                pixels[pi+1]=(byte)cg[ii]; // G
+                                pixels[pi+2]=(byte)cr[ii]; // R
+ 
+                                if (fourCC == DXT5)
+                                {
+                                    int ai = py*4+px;
+                                    int alphaIdx=(int)((aBits>>(ai*3))&7);
+                                    int alpha;
+                                    if      (alphaIdx==0) alpha=a0;
+                                    else if (alphaIdx==1) alpha=a1;
+                                    else if (a0>a1)       alpha=((8-alphaIdx)*a0+(alphaIdx-1)*a1)/7;
+                                    else if (alphaIdx<=5) alpha=((6-alphaIdx)*a0+(alphaIdx-1)*a1)/5;
+                                    else                  alpha=alphaIdx==6?0:255;
+                                    pixels[pi+3]=(byte)alpha;
+                                }
+                                else pixels[pi+3]=(byte)ca[ii];
+                            }
                         }
+                    }
+                    else if ((pfFlags & 0x40u) != 0) // uncompressed RGB(A)
+                    {
+                        bool hasAlpha = (pfFlags & 0x1u) != 0;
+                        for (int i=0; i<w*h*4; i+=4)
+                        {
+                            pixels[i+2]=br.ReadByte(); // R
+                            pixels[i+1]=br.ReadByte(); // G
+                            pixels[i  ]=br.ReadByte(); // B
+                            pixels[i+3]=hasAlpha ? br.ReadByte() : (byte)255;
+                        }
+                    }
+                    else return null;
+ 
+                    var bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    var bd  = bmp.LockBits(new Rectangle(0,0,w,h),
+                        System.Drawing.Imaging.ImageLockMode.WriteOnly,
+                        System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    System.Runtime.InteropServices.Marshal.Copy(pixels, 0, bd.Scan0, pixels.Length);
+                    bmp.UnlockBits(bd);
                     return bmp;
                 }
             }
@@ -605,10 +740,17 @@ void main() { FragColor = vec4(color, 1.0); }
         private Shader mainShader, wireShader;
         private int cubeVAO, cubeVBO;
  
-        // -- UV / texture preview cache: rebuild once, blit on Paint --
+        // -- UV / texture preview cache --
         private Bitmap uvCache;
         private Bitmap texPreviewBmp;
         private bool   uvDirty = true;
+        // -- Texture file watchers (auto-reload on external edit) --
+        private readonly System.IO.FileSystemWatcher[] _texWatchers = new System.IO.FileSystemWatcher[6];
+        private readonly DateTime[] _lastReload = new DateTime[6];
+        // -- Smooth theme transition (0=light, 1=dark) --
+        private float _themeT      = 0f;
+        private float _themeTarget = 0f;
+        private System.Windows.Forms.Timer _themeTimer;
  
 // =============================================================================
 //  SECTION 6 - FORM CONSTRUCTION & UI LAYOUT
@@ -636,7 +778,7 @@ void main() { FragColor = vec4(color, 1.0); }
         private void BuildUI()
         {
             Text        = "HotDog ? 3D Viewer";
-            ClientSize  = new Size(1200, 800);
+            ClientSize  = new Size(1280, 960);
             MinimumSize = new Size(800, 600);
             AllowDrop   = true;
             DragEnter  += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
@@ -704,7 +846,7 @@ void main() { FragColor = vec4(color, 1.0); }
             previewPanel = new Panel
             {
                 Location = new Point(10, y), Size = new Size(270, 270),
-                BackColor = Color.FromArgb(250, 250, 250), BorderStyle = BorderStyle.FixedSingle
+                BackColor = Color.FromArgb(30,  30,  30),  BorderStyle = BorderStyle.FixedSingle
             };
             previewPanel.Paint  += OnUVPaint;
             previewPanel.Resize += (s, e) => { uvDirty = true; previewPanel.Invalidate(); };
@@ -820,10 +962,23 @@ void main() { FragColor = vec4(color, 1.0); }
             GL.Enable(EnableCap.LineSmooth);
             GL.Hint(HintTarget.LineSmoothHint, HintMode.Nicest);
             // Light theme by default (M key toggles dark/light)
-            GL.ClearColor(1f, 1f, 1f, 1f);
+            GL.ClearColor(0.867f,0.867f,0.867f,1f);
  
             BuildCubeGPU();
             GL.Viewport(0, 0, glControl.Width, glControl.Height);
+ 
+            // Smooth theme transition timer (~60fps)
+            _themeTimer = new System.Windows.Forms.Timer { Interval = 16 };
+            _themeTimer.Tick += (s, e) =>
+            {
+                float step = 0.06f;
+                float diff = _themeTarget - _themeT;
+                if (Math.Abs(diff) <= step) { _themeT = _themeTarget; _themeTimer.Stop(); }
+                else                          _themeT += diff > 0 ? step : -step;
+                // Rerender UV box background during transition
+                previewPanel.Invalidate();
+                glControl.Invalidate();
+            };
         }
  
         private void BuildCubeGPU()
@@ -863,8 +1018,9 @@ void main() { FragColor = vec4(color, 1.0); }
         private void OnPaint(object sender, PaintEventArgs e)
         {
             glControl.MakeCurrent();
-            if (darkTheme) GL.ClearColor(0.18f, 0.18f, 0.18f, 1f);
-            else           GL.ClearColor(1.00f, 1.00f, 1.00f, 1f);
+            // Smooth theme transition: interpolate between light (#DDDDDD) and dark (0.18)
+            float bg = 0.867f * (1f - _themeT) + 0.18f * _themeT;
+            GL.ClearColor(bg, bg, bg, 1f);
             GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
  
             float aspect = (float)glControl.Width / Math.Max(glControl.Height, 1);
@@ -901,9 +1057,9 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetVec3("color", new Vector3(0.86f, 0.86f, 0.86f));
                 DrawMesh();
  
-                // Line pass (black edges)
+                // Line pass (black edges) – slightly thicker to survive MSAA
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
-                GL.LineWidth(1f);
+                GL.LineWidth(1.6f);
                 wireShader.SetVec3("color", darkTheme ? new Vector3(0.08f, 0.08f, 0.08f) : new Vector3(0.05f, 0.05f, 0.05f));
                 DrawMesh();
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
@@ -975,7 +1131,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
                 if (showGrid)
                 {
-                    GL.LineWidth(1f);
+                    GL.LineWidth(1.8f);
                     var gc = darkTheme ? new Vector3(0.42f, 0.42f, 0.42f) : new Vector3(0.15f, 0.15f, 0.15f);
                     wireShader.SetVec3("color", gc);
                     GL.DrawArrays(PrimitiveType.Lines, 0, 21 * 4); // 21 rows ? 2 lines ? 2 verts
@@ -1019,9 +1175,11 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void OnUVPaint(object sender, PaintEventArgs e)
         {
+            // Always dark background regardless of app theme
+            e.Graphics.Clear(Color.FromArgb(30, 30, 30));
+ 
             if (!showUV || model == null || model.TexCoords.Count == 0)
             {
-                e.Graphics.Clear(Color.FromArgb(40, 40, 40));
                 using (var f = new Font("Segoe UI", 9))
                     e.Graphics.DrawString("No UV data", f, Brushes.Gray, 10, 10);
                 return;
@@ -1054,8 +1212,8 @@ void main() { FragColor = vec4(color, 1.0); }
                 const float pad = 10f;
                 float scale = Math.Min(pw - pad * 2, ph - pad * 2);
  
-                // Background grid (semi-transparent)
-                var gridColor = darkTheme ? Color.FromArgb(90, 100, 100, 100) : Color.FromArgb(90, 150, 150, 150);
+                // UV box always uses the dark-mode palette regardless of theme
+                var gridColor = Color.FromArgb(70, 100, 100, 100);
                 using (var gp = new Pen(gridColor, 0.5f))
                     for (int i = 0; i <= 4; i++)
                     {
@@ -1065,11 +1223,11 @@ void main() { FragColor = vec4(color, 1.0); }
                     }
  
                 // UV-space boundary
-                var borderColor = darkTheme ? Color.FromArgb(95, 95, 95) : Color.FromArgb(160, 160, 160);
+                var borderColor = Color.FromArgb(95, 95, 95);
                 g.DrawRectangle(new Pen(borderColor, 1f), pad, pad, scale, scale);
  
-                // Draw all unique UV edges
-                var lineColor = darkTheme ? Color.FromArgb(255, 165, 0) : Color.FromArgb(220, 90, 0);
+                // UV edges – always classic orange on dark
+                var lineColor = Color.FromArgb(255, 165, 0);
                 using (var pen = new Pen(lineColor, 1f))
                 {
                     var drawn = new HashSet<long>();
@@ -1098,14 +1256,20 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void OnKey(object sender, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.R) { ResetCam(); e.Handled = true; }
-            else if (e.KeyCode == Keys.F) { FocusModel(); e.Handled = true; }
-            else if (e.KeyCode == Keys.M) { ToggleTheme(); e.Handled = true; }
+            if      (e.KeyCode == Keys.R) { ResetCam();    e.Handled = e.SuppressKeyPress = true; }
+            else if (e.KeyCode == Keys.Return)
+            {
+                // SuppressKeyPress stops Enter from activating the focused button
+                e.Handled = e.SuppressKeyPress = true;
+                ExportOBJ();
+            }
+            else if (e.KeyCode == Keys.F) { FocusModel();  e.Handled = e.SuppressKeyPress = true; }
+            else if (e.KeyCode == Keys.M) { ToggleTheme(); e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.N && model != null)
             {
                 model.RecalcNormals();
                 glControl.Invalidate();
-                e.Handled = true;
+                e.Handled = e.SuppressKeyPress = true;
             }
         }
  
@@ -1122,10 +1286,116 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void ToggleTheme()
         {
-            darkTheme = !darkTheme;
+            darkTheme      = !darkTheme;
+            _themeTarget   = darkTheme ? 1f : 0f;
+            _themeTimer.Start();   // animates _themeT toward _themeTarget
             uvDirty = true;
             previewPanel.Invalidate();
-            glControl.Invalidate();
+        }
+ 
+        // -------------------------------------------------------------------
+        // OBJ Export  (Enter key)  - inside Viewer3DForm
+        // -------------------------------------------------------------------
+        private void ExportOBJ()
+        {
+            if (model == null)
+            {
+                MessageBox.Show("No model loaded.", "Export OBJ",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            using (var dlg = new SaveFileDialog())
+            {
+                dlg.Title    = "Export OBJ";
+                dlg.Filter   = "Wavefront OBJ (*.obj)|*.obj";
+                dlg.FileName = "model.obj";
+                if (dlg.ShowDialog() != DialogResult.OK) return;
+ 
+                string objPath  = dlg.FileName;
+                string dir      = Path.GetDirectoryName(objPath);
+                string baseName = Path.GetFileNameWithoutExtension(objPath);
+                string texDir   = Path.Combine(dir, baseName + "_textures");
+ 
+                // --- Export textures as PNG ---
+                string[] mtlKeys   = { "map_Kd","map_Bump","map_Ks","map_Pr","map_Pm","map_d" };
+                string[] texLabels = { "Color","Normal","Specular","Roughness","Metallic","Opacity" };
+                var exported = new Dictionary<int, string>();
+                for (int s = 0; s < 6; s++)
+                {
+                    string src = model.TexPaths[s];
+                    if (src == null || !File.Exists(src)) continue;
+                    try
+                    {
+                        Directory.CreateDirectory(texDir);
+                        string outName = texLabels[s] + ".png";
+                        string ext2    = Path.GetExtension(src).ToLowerInvariant();
+                        Bitmap bmp2 =
+                            ext2 == ".dds" ? model.LoadDDSPublic(src) :
+                            ext2 == ".tga" ? model.LoadTGAPublic(src) :
+                            new Bitmap(src);
+                        if (bmp2 != null)
+                        {
+                            bmp2.Save(Path.Combine(texDir, outName),
+                                      System.Drawing.Imaging.ImageFormat.Png);
+                            bmp2.Dispose();
+                            exported[s] = outName;
+                        }
+                    }
+                    catch { /* skip unreadable */ }
+                }
+ 
+                var ic = System.Globalization.CultureInfo.InvariantCulture;
+                string F(float v) => v.ToString("G6", ic);
+ 
+                // --- Write MTL ---
+                string mtlName = baseName + ".mtl";
+                var mtl = new StringBuilder();
+                mtl.AppendLine("# Black3DViewer export");
+                mtl.AppendLine("newmtl mat0");
+                mtl.AppendLine("Ka 1 1 1");  mtl.AppendLine("Kd 1 1 1");
+                mtl.AppendLine("Ks 0 0 0");  mtl.AppendLine("d 1");
+                foreach (var kv in exported)
+                    mtl.AppendLine($"{mtlKeys[kv.Key]} {baseName}_textures/{kv.Value}");
+                File.WriteAllText(Path.Combine(dir, mtlName), mtl.ToString(), Encoding.UTF8);
+ 
+                // --- Write OBJ ---
+                var sb = new StringBuilder();
+                sb.AppendLine("# Black3DViewer export");
+                sb.AppendLine($"mtllib {mtlName}");
+                sb.AppendLine("g default");
+                sb.AppendLine("usemtl mat0");
+                sb.AppendLine();
+                foreach (var v  in model.Vertices)   sb.AppendLine($"v  {F(v.X)} {F(v.Y)} {F(v.Z)}");
+                sb.AppendLine();
+                foreach (var uv in model.TexCoords)  sb.AppendLine($"vt {F(uv.X)} {F(uv.Y)}");
+                sb.AppendLine();
+                foreach (var n  in model.Normals)    sb.AppendLine($"vn {F(n.X)} {F(n.Y)} {F(n.Z)}");
+                sb.AppendLine();
+                bool hasUV2 = model.TexCoords.Count > 0;
+                bool hasN2  = model.Normals.Count   > 0;
+                foreach (var face in model.Faces)
+                {
+                    sb.Append("f");
+                    for (int i = 0; i < 3; i++)
+                    {
+                        int vi = face.VI[i] + 1;
+                        int ti = hasUV2 && face.TI != null && i < face.TI.Length ? face.TI[i]+1 : 0;
+                        int ni = hasN2  && face.NI != null && i < face.NI.Length && face.NI[i]>=0 ? face.NI[i]+1 : 0;
+                        if      (ti>0 && ni>0) sb.Append($" {vi}/{ti}/{ni}");
+                        else if (ti>0)         sb.Append($" {vi}/{ti}");
+                        else if (ni>0)         sb.Append($" {vi}//{ni}");
+                        else                   sb.Append($" {vi}");
+                    }
+                    sb.AppendLine();
+                }
+                File.WriteAllText(objPath, sb.ToString(), Encoding.UTF8);
+ 
+                string msg = $"Saved:\n  {Path.GetFileName(objPath)}\n  {mtlName}";
+                if (exported.Count > 0)
+                    msg += $"\n  {exported.Count} texture(s) in {baseName}_textures/";
+                MessageBox.Show(msg, "Export Complete",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
  
         private void ResetCam()
@@ -1146,7 +1416,7 @@ void main() { FragColor = vec4(color, 1.0); }
         {
             if (e.Button == MouseButtons.Left)
             {
-                if ((DateTime.Now - lastClick).TotalMilliseconds < 300) ResetCam();
+                if ((DateTime.Now - lastClick).TotalMilliseconds < 200) ResetCam();
                 dragRot = true; lastMouse = e.Location; lastClick = DateTime.Now;
             }
             else if (e.Button == MouseButtons.Right)
@@ -1189,13 +1459,15 @@ void main() { FragColor = vec4(color, 1.0); }
  
                 float ry = MathHelper.DegreesToRadians(rotY);
                 float rx = MathHelper.DegreesToRadians(rotX);
-                var right = new Vector3( (float)Math.Cos(ry), 0f, -(float)Math.Sin(ry));
+                // Camera-space axes from arcball rotation (cross-product derived)
+                // right = forward x world-up  =>  (cos ry, 0, -sin ry)
+                // up    = right x forward      =>  (-sin ry sin rx, cos rx, -cos ry sin rx)
+                var right = new Vector3((float)Math.Cos(ry), 0f, -(float)Math.Sin(ry));
                 var up    = new Vector3(
-                    (float)(Math.Sin(ry) * Math.Sin(rx)),
-                    (float)Math.Cos(rx),
-                    (float)(Math.Cos(ry) * Math.Sin(rx)));
+                    -(float)(Math.Sin(ry) * Math.Sin(rx)),
+                     (float)Math.Cos(rx),
+                    -(float)(Math.Cos(ry) * Math.Sin(rx)));
  
-                // FIX: subtract right*dx ? scene follows the drag (grab style)
                 lookAt -= right * dx;
                 lookAt += up    * dy;
                 lastMouse = e.Location;
@@ -1287,6 +1559,11 @@ void main() { FragColor = vec4(color, 1.0); }
             RefreshTexBtns();
             RefreshTexBtnEnabled();
             UpdateStatLabels();
+ 
+            // Set up file-change watchers for every loaded texture slot
+            for (int ws = 0; ws < 6; ws++)
+                SetupTexWatcher(ws, model.TexPaths[ws]);
+ 
             previewPanel.Invalidate();
             glControl.Invalidate();
         }
@@ -1301,6 +1578,7 @@ void main() { FragColor = vec4(color, 1.0); }
             else if (TEX_EXT.Contains(ext) && model != null)
             {
                 model.LoadTexture(f, texSlot);
+                SetupTexWatcher(texSlot, f);
                 texPreviewBmp?.Dispose(); texPreviewBmp = null;
                 RefreshTexBtnEnabled();
                 UpdateNoTex();
@@ -1373,13 +1651,73 @@ void main() { FragColor = vec4(color, 1.0); }
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             base.OnFormClosing(e);
+            for (int ws = 0; ws < 6; ws++) { try { _texWatchers[ws]?.Dispose(); } catch { } }
+            _themeTimer?.Dispose();
             model?.Cleanup();
             uvCache?.Dispose();
             texPreviewBmp?.Dispose();
             if (cubeVAO != 0) GL.DeleteVertexArray(cubeVAO);
             if (cubeVBO != 0) GL.DeleteBuffer(cubeVBO);
         }
-    }
+ 
+// =============================================================================
+//  TEXTURE FILE WATCHER - auto-reload textures on external edits
+// =============================================================================
+ 
+        private void SetupTexWatcher(int slot, string path)
+        {
+            // Dispose any previous watcher for this slot
+            try { _texWatchers[slot]?.Dispose(); } catch { }
+            _texWatchers[slot] = null;
+ 
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            string dir  = Path.GetDirectoryName(path);
+            string file = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(dir)) return;
+ 
+            var w = new System.IO.FileSystemWatcher(dir, file)
+            {
+                NotifyFilter        = System.IO.NotifyFilters.LastWrite | System.IO.NotifyFilters.Size,
+                EnableRaisingEvents = true
+            };
+            int capturedSlot = slot;
+            w.Changed += (_, __) =>
+            {
+                // Debounce: only act if >400 ms since last reload for this slot
+                if ((DateTime.Now - _lastReload[capturedSlot]).TotalMilliseconds < 400) return;
+                _lastReload[capturedSlot] = DateTime.Now;
+                System.Threading.Thread.Sleep(300); // let the app finish writing
+                if (IsDisposed) return;
+                try { BeginInvoke((Action)(() => ReloadTextureSlot(capturedSlot))); } catch { }
+            };
+            _texWatchers[slot] = w;
+        }
+ 
+        private void ReloadTextureSlot(int slot)
+        {
+            if (model == null) return;
+            string path = model.TexPaths[slot];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+ 
+            glControl.MakeCurrent();
+ 
+            // Delete the old GPU texture before uploading the new one
+            int oldId = model.GetTexId(slot);
+            if (oldId >= 0) GL.DeleteTexture(oldId);
+ 
+            // Reload from disk
+            model.LoadTexture(path, slot);
+ 
+            // Invalidate preview if colour map changed
+            if (slot == 0) { texPreviewBmp?.Dispose(); texPreviewBmp = null; }
+ 
+            RefreshTexBtnEnabled();
+            UpdateNoTex();
+            previewPanel.Invalidate();
+            glControl.Invalidate();
+        }
+ 
+    } // end Viewer3DForm
  
 // ============================================================================================================================
 //  ________ ___  ___       ________          ________ ________  ________  _____   ____   ________  __________ ________      ||
@@ -1619,8 +1957,10 @@ void main() { FragColor = vec4(color, 1.0); }
         private static readonly Dictionary<int, int> UvOffsets =
             new Dictionary<int, int> { { 184, 60 }, { 160, 52 }, { 56, 48 }, { 20, 12 } };
  
+        // posOff = byte offset in vertex record for XYZ floats (usually 0).
+        // uvOff  = byte offset for UV; pass -1 to auto-detect from stride table.
         public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
-            Load(string path)
+            Load(string path, int posOff = 0, int uvOff = -1)
         {
             var verts = new List<Vector3>(); var uvs = new List<Vector2>();
             var norms = new List<Vector3>(); var faces = new List<MeshFace>();
@@ -1657,21 +1997,26 @@ void main() { FragColor = vec4(color, 1.0); }
                                        new[] { i0, i1, i2 }));
             }
  
-            // Read vertices
             int vdStart = faceStart + faceCount * 12;
-            UvOffsets.TryGetValue(stride, out int uvOff);
+            if (uvOff < 0) UvOffsets.TryGetValue(stride, out uvOff); // auto-detect
+            int normOff = posOff + 12; // normals follow position by default
  
             for (int i = 0; i < vertCount; i++)
             {
                 int vOff = vdStart + i * stride;
-                if (vOff + 24 > data.Length) break;
+                if (vOff + posOff + 12 > data.Length) break;
  
-                float x  = BitConverter.ToSingle(data, vOff);
-                float y  = BitConverter.ToSingle(data, vOff + 4);
-                float z  = BitConverter.ToSingle(data, vOff + 8);
-                float nx = BitConverter.ToSingle(data, vOff + 12);
-                float ny = BitConverter.ToSingle(data, vOff + 16);
-                float nz = BitConverter.ToSingle(data, vOff + 20);
+                float x = BitConverter.ToSingle(data, vOff + posOff);
+                float y = BitConverter.ToSingle(data, vOff + posOff + 4);
+                float z = BitConverter.ToSingle(data, vOff + posOff + 8);
+ 
+                float nx = 0, ny = 1, nz = 0;
+                if (vOff + normOff + 12 <= data.Length)
+                {
+                    nx = BitConverter.ToSingle(data, vOff + normOff);
+                    ny = BitConverter.ToSingle(data, vOff + normOff + 4);
+                    nz = BitConverter.ToSingle(data, vOff + normOff + 8);
+                }
  
                 var vert = new Vector3(x, y, z);
                 verts.Add(vert);
@@ -1685,8 +2030,7 @@ void main() { FragColor = vec4(color, 1.0); }
                     float vv = 1f - BitConverter.ToSingle(data, vOff + uvOff + 4);
                     uvs.Add(new Vector2(u, vv));
                 }
-                else
-                    uvs.Add(Vector2.Zero);
+                else uvs.Add(Vector2.Zero);
             }
             return (verts, uvs, norms, faces, bMin, bMax);
         }
@@ -2227,7 +2571,7 @@ void main() { FragColor = vec4(color, 1.0); }
         }
     }
  
-
+ 
 // =============================================================================
 //  THE ENDING - PROGRAM ENTRY POINT
 // =============================================================================
