@@ -245,20 +245,20 @@ void main() { FragColor = vec4(color, 1.0); }
                 switch (ext)
                 {
                     case ".obj": (v, uv, n, f, bMin, bMax) = ObjLoader.Load(path); break;
-                    case ".csv": (v, uv, n, f, bMin, bMax) = CsvLoader.Load(path); break;
-                    case ".stl": (v, uv, n, f, bMin, bMax) = StlLoader.Load(path); break;
-                    case ".rip":
-                        // Ask user for field offsets via popup
-                        int ripPos = 0, ripUv = -1;
-                        if (RipFieldsSelector != null)
+                    case ".csv":
+                        // Ask user which columns hold X,Y,Z,U,V via popup
+                        int cx=2,cy=3,cz=4,cu=5,cvv=6; bool hdr=true;
+                        if (CsvFieldsSelector != null)
                         {
-                            var ans = RipFieldsSelector(path);
-                            if (!ans.HasValue) return; // user cancelled
-                            ripPos = ans.Value.posOff;
-                            ripUv  = ans.Value.uvOff;
+                            var csvAns = CsvFieldsSelector(path);
+                            if (!csvAns.HasValue) return; // user cancelled
+                            cx=csvAns.Value.colX; cy=csvAns.Value.colY; cz=csvAns.Value.colZ;
+                            cu=csvAns.Value.colU; cvv=csvAns.Value.colV; hdr=csvAns.Value.header;
                         }
-                        (v, uv, n, f, bMin, bMax) = NR1Loader.Load(path, ripPos, ripUv);
+                        (v, uv, n, f, bMin, bMax) = CsvLoader.Load(path, cx, cy, cz, cu, cvv, hdr);
                         break;
+                    case ".stl": (v, uv, n, f, bMin, bMax) = StlLoader.Load(path); break;
+                    case ".rip": (v, uv, n, f, bMin, bMax) = NR1Loader.Load(path); break;
                     case ".nr":  (v, uv, n, f, bMin, bMax) = NR2Loader.Load(path); break;
                     case ".glb": (v, uv, n, f, bMin, bMax) = GlbLoader.Load(path); break;
                     case ".dae": (v, uv, n, f, bMin, bMax) = DaeLoader.Load(path); break;
@@ -311,9 +311,9 @@ void main() { FragColor = vec4(color, 1.0); }
             }
         }
  
-        // Prompt shown before loading .rip files; set by Viewer3DForm on startup.
-        // Returns (posByteOffset, uvByteOffset) or null to cancel.
-        public static Func<string, (int posOff, int uvOff)?> RipFieldsSelector = null;
+        // Prompt shown before loading .csv files; assigned by Viewer3DForm.
+        // Returns column mapping or null when the user cancels.
+        public static Func<string, (int colX,int colY,int colZ,int colU,int colV,bool header)?> CsvFieldsSelector = null;
  
         // -- Normal recalculation (smooth) -------------------------------------
         public void RecalcNormals()
@@ -744,9 +744,10 @@ void main() { FragColor = vec4(color, 1.0); }
         private Bitmap uvCache;
         private Bitmap texPreviewBmp;
         private bool   uvDirty = true;
-        // -- Texture file watchers (auto-reload on external edit) --
-        private readonly System.IO.FileSystemWatcher[] _texWatchers = new System.IO.FileSystemWatcher[6];
-        private readonly DateTime[] _lastReload = new DateTime[6];
+        // -- Texture hot-reload: poll LastWriteTime every 500 ms (works with all editors) --
+        private readonly string[]   _hotPaths     = new string[6];
+        private readonly DateTime[] _hotLastWrite = new DateTime[6];
+        private System.Windows.Forms.Timer _hotReloadTimer;
         // -- Smooth theme transition (0=light, 1=dark) --
         private float _themeT      = 0f;
         private float _themeTarget = 0f;
@@ -773,12 +774,23 @@ void main() { FragColor = vec4(color, 1.0); }
             KeyDown   += OnKey;
             glControl.Resize += (s, e) => { GL.Viewport(0, 0, glControl.Width, glControl.Height); glControl.Invalidate(); };
             UpdateStatLabels();
+ 
+            // Register CSV column-picker: shows a dialog before every .csv load
+            GPUModel.CsvFieldsSelector = (csvPath) =>
+            {
+                using (var dlg = new CsvColumnsDialog(csvPath))
+                {
+                    dlg.ShowDialog(this);
+                    if (!dlg.Confirmed) return null;
+                    return (dlg.ColX, dlg.ColY, dlg.ColZ, dlg.ColU, dlg.ColV, dlg.HasHeader);
+                }
+            };
         }
  
         private void BuildUI()
         {
             Text        = "HotDog ? 3D Viewer";
-            ClientSize  = new Size(1280, 960);
+            ClientSize  = new Size(1200, 800);
             MinimumSize = new Size(800, 600);
             AllowDrop   = true;
             DragEnter  += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
@@ -975,10 +987,16 @@ void main() { FragColor = vec4(color, 1.0); }
                 float diff = _themeTarget - _themeT;
                 if (Math.Abs(diff) <= step) { _themeT = _themeTarget; _themeTimer.Stop(); }
                 else                          _themeT += diff > 0 ? step : -step;
-                // Rerender UV box background during transition
                 previewPanel.Invalidate();
                 glControl.Invalidate();
             };
+ 
+            // Hot-reload: poll file LastWriteTime every 500 ms.
+            // Works with ALL editors (Photoshop, Substance, GIMP) because it catches
+            // atomic-rename saves that FileSystemWatcher.Changed never sees.
+            _hotReloadTimer = new System.Windows.Forms.Timer { Interval = 500 };
+            _hotReloadTimer.Tick += HotReloadTick;
+            _hotReloadTimer.Start();
         }
  
         private void BuildCubeGPU()
@@ -1254,15 +1272,21 @@ void main() { FragColor = vec4(color, 1.0); }
 //  SECTION 9 - CAMERA & INPUT
 // =============================================================================
  
+        // ProcessCmdKey fires before ANY focused control (including buttons) gets the key.
+        // This is the only reliable way to intercept Enter without the Load button eating it.
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Return || keyData == Keys.Enter)
+            {
+                if (model != null) ExportOBJ();
+                return true; // consumed – do NOT forward to focused button
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+ 
         private void OnKey(object sender, KeyEventArgs e)
         {
             if      (e.KeyCode == Keys.R) { ResetCam();    e.Handled = e.SuppressKeyPress = true; }
-            else if (e.KeyCode == Keys.Return)
-            {
-                // SuppressKeyPress stops Enter from activating the focused button
-                e.Handled = e.SuppressKeyPress = true;
-                ExportOBJ();
-            }
             else if (e.KeyCode == Keys.F) { FocusModel();  e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.M) { ToggleTheme(); e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.N && model != null)
@@ -1416,7 +1440,7 @@ void main() { FragColor = vec4(color, 1.0); }
         {
             if (e.Button == MouseButtons.Left)
             {
-                if ((DateTime.Now - lastClick).TotalMilliseconds < 200) ResetCam();
+                if ((DateTime.Now - lastClick).TotalMilliseconds < 300) ResetCam();
                 dragRot = true; lastMouse = e.Location; lastClick = DateTime.Now;
             }
             else if (e.Button == MouseButtons.Right)
@@ -1562,7 +1586,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
             // Set up file-change watchers for every loaded texture slot
             for (int ws = 0; ws < 6; ws++)
-                SetupTexWatcher(ws, model.TexPaths[ws]);
+                TrackTexture(ws, model.TexPaths[ws]);
  
             previewPanel.Invalidate();
             glControl.Invalidate();
@@ -1578,7 +1602,7 @@ void main() { FragColor = vec4(color, 1.0); }
             else if (TEX_EXT.Contains(ext) && model != null)
             {
                 model.LoadTexture(f, texSlot);
-                SetupTexWatcher(texSlot, f);
+                TrackTexture(texSlot, f);
                 texPreviewBmp?.Dispose(); texPreviewBmp = null;
                 RefreshTexBtnEnabled();
                 UpdateNoTex();
@@ -1651,8 +1675,8 @@ void main() { FragColor = vec4(color, 1.0); }
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             base.OnFormClosing(e);
-            for (int ws = 0; ws < 6; ws++) { try { _texWatchers[ws]?.Dispose(); } catch { } }
-            _themeTimer?.Dispose();
+            _hotReloadTimer?.Stop(); _hotReloadTimer?.Dispose();
+            _themeTimer?.Stop(); _themeTimer?.Dispose();
             model?.Cleanup();
             uvCache?.Dispose();
             texPreviewBmp?.Dispose();
@@ -1661,60 +1685,46 @@ void main() { FragColor = vec4(color, 1.0); }
         }
  
 // =============================================================================
-//  TEXTURE FILE WATCHER - auto-reload textures on external edits
+//  TEXTURE HOT-RELOAD  (polls LastWriteTime every 500 ms – works with all editors)
 // =============================================================================
  
-        private void SetupTexWatcher(int slot, string path)
+        // Register a path to be polled; call whenever a texture slot is loaded/changed.
+        private void TrackTexture(int slot, string path)
         {
-            // Dispose any previous watcher for this slot
-            try { _texWatchers[slot]?.Dispose(); } catch { }
-            _texWatchers[slot] = null;
- 
-            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
-            string dir  = Path.GetDirectoryName(path);
-            string file = Path.GetFileName(path);
-            if (string.IsNullOrEmpty(dir)) return;
- 
-            var w = new System.IO.FileSystemWatcher(dir, file)
-            {
-                NotifyFilter        = System.IO.NotifyFilters.LastWrite | System.IO.NotifyFilters.Size,
-                EnableRaisingEvents = true
-            };
-            int capturedSlot = slot;
-            w.Changed += (_, __) =>
-            {
-                // Debounce: only act if >400 ms since last reload for this slot
-                if ((DateTime.Now - _lastReload[capturedSlot]).TotalMilliseconds < 400) return;
-                _lastReload[capturedSlot] = DateTime.Now;
-                System.Threading.Thread.Sleep(300); // let the app finish writing
-                if (IsDisposed) return;
-                try { BeginInvoke((Action)(() => ReloadTextureSlot(capturedSlot))); } catch { }
-            };
-            _texWatchers[slot] = w;
+            _hotPaths[slot]     = path;
+            _hotLastWrite[slot] = string.IsNullOrEmpty(path) || !File.Exists(path)
+                                  ? DateTime.MinValue
+                                  : File.GetLastWriteTimeUtc(path);
         }
  
-        private void ReloadTextureSlot(int slot)
+        // Runs on the UI thread via the WinForms timer – safe to touch GL here.
+        private void HotReloadTick(object sender, EventArgs e)
         {
             if (model == null) return;
-            string path = model.TexPaths[slot];
-            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+            for (int s = 0; s < 6; s++)
+            {
+                string path = _hotPaths[s];
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) continue;
  
-            glControl.MakeCurrent();
+                DateTime wt;
+                try { wt = File.GetLastWriteTimeUtc(path); } catch { continue; }
  
-            // Delete the old GPU texture before uploading the new one
-            int oldId = model.GetTexId(slot);
-            if (oldId >= 0) GL.DeleteTexture(oldId);
+                if (wt <= _hotLastWrite[s]) continue;   // not changed
+                _hotLastWrite[s] = wt;                   // update stamp first
  
-            // Reload from disk
-            model.LoadTexture(path, slot);
+                // Reload texture on GPU
+                glControl.MakeCurrent();
+                int oldId = model.GetTexId(s);
+                if (oldId >= 0) GL.DeleteTexture(oldId);
+                model.LoadTexture(path, s);
  
-            // Invalidate preview if colour map changed
-            if (slot == 0) { texPreviewBmp?.Dispose(); texPreviewBmp = null; }
+                if (s == 0) { texPreviewBmp?.Dispose(); texPreviewBmp = null; }
  
-            RefreshTexBtnEnabled();
-            UpdateNoTex();
-            previewPanel.Invalidate();
-            glControl.Invalidate();
+                RefreshTexBtnEnabled();
+                UpdateNoTex();
+                previewPanel.Invalidate();
+                glControl.Invalidate();
+            }
         }
  
     } // end Viewer3DForm
@@ -1802,8 +1812,10 @@ void main() { FragColor = vec4(color, 1.0); }
     // Every 3 rows form one triangle.
     public static class CsvLoader
     {
+        // colX/Y/Z = 0-based column indices for position; colU/V for texture coords.
+        // Defaults match the common NinjaRipper/export layout: X=2 Y=3 Z=4 U=5 V=6.
         public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
-            Load(string path)
+            Load(string path, int colX=2, int colY=3, int colZ=4, int colU=5, int colV=6, bool hasHeader=true)
         {
             var verts = new List<Vector3>(); var uvs = new List<Vector2>();
             var norms = new List<Vector3>(); var faces = new List<MeshFace>();
@@ -1811,15 +1823,20 @@ void main() { FragColor = vec4(color, 1.0); }
             var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
  
             var lines = File.ReadAllLines(path);
+            int startLine = hasHeader ? 1 : 0;
+            int need = Math.Max(Math.Max(colX,colY), Math.Max(colZ,Math.Max(colU,colV))) + 1;
             int rowInFace = 0;
  
-            for (int li = 1; li < lines.Length; li++)  // skip header row
+            for (int li = startLine; li < lines.Length; li++)
             {
                 var p = lines[li].Split(',');
-                if (p.Length < 7) continue;
+                if (p.Length < need) continue;
  
-                float x = F(p[2]), y = F(p[3]), z = -F(p[4]);   // mirror Z
-                float u = F(p[5]), vv = 1f - F(p[6]);            // flip V
+                float x  = F(p[colX]);
+                float y  = F(p[colY]);
+                float z  = -F(p[colZ]);             // mirror Z axis
+                float u  = F(p[colU]);
+                float vv = 1f - F(p[colV]);         // flip V
                 var vert = new Vector3(x, y, z);
                 verts.Add(vert);
                 uvs.Add(new Vector2(u, vv));
@@ -1837,6 +1854,20 @@ void main() { FragColor = vec4(color, 1.0); }
                 }
             }
             return (verts, uvs, norms, faces, bMin, bMax);
+        }
+ 
+        // Peek at the first data row and return column header names
+        public static string[] ReadHeaders(string path)
+        {
+            try
+            {
+                using (var sr = new StreamReader(path))
+                {
+                    string line = sr.ReadLine();
+                    return line?.Split(',') ?? new string[0];
+                }
+            }
+            catch { return new string[0]; }
         }
  
         static float F(string s)
@@ -2571,6 +2602,119 @@ void main() { FragColor = vec4(color, 1.0); }
         }
     }
  
+ 
+// =============================================================================
+//  CSV COLUMN PICKER DIALOG
+//  Shown before loading any .csv file so the user can confirm or override
+//  which zero-based column indices hold X, Y, Z, U, V data.
+// =============================================================================
+ 
+    public class CsvColumnsDialog : Form
+    {
+        public int  ColX, ColY, ColZ, ColU, ColV;
+        public bool HasHeader;
+        public bool Confirmed;
+ 
+        private static readonly Color BG   = Color.FromArgb(240, 240, 240);
+        private static readonly Color IDLE  = Color.FromArgb(225, 225, 225);
+        private static readonly Color PRESS = Color.FromArgb(204, 228, 247);
+        private static readonly Color BORD  = Color.FromArgb(173, 173, 173);
+ 
+        public CsvColumnsDialog(string csvPath,
+            int defX=2, int defY=3, int defZ=4, int defU=5, int defV=6, bool defHdr=true)
+        {
+            Text            = "CSV Column Mapping";
+            ClientSize      = new Size(428, 388);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox     = MinimizeBox = false;
+            StartPosition   = FormStartPosition.CenterParent;
+            BackColor       = BG;
+            Font            = new Font("Segoe UI", 9f);
+            KeyPreview      = true;
+            KeyDown        += (s, e) => { if (e.KeyCode == Keys.Escape) { Confirmed = false; Close(); } };
+ 
+            // Title + filename
+            Add(new Label { Text = "CSV Column Mapping:", Location = new Point(14, 12),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold), AutoSize = true });
+            string fn = Path.GetFileName(csvPath);
+            Add(new Label { Text = fn.Length > 56 ? fn.Substring(0, 53) + "..." : fn,
+                Location = new Point(14, 32), Size = new Size(400, 18),
+                ForeColor = Color.FromArgb(0, 80, 160) });
+ 
+            // Header-row preview (shows column indices)
+            var headers = CsvLoader.ReadHeaders(csvPath);
+            var previewParts = new System.Text.StringBuilder();
+            for (int i = 0; i < Math.Min(headers.Length, 12); i++)
+                previewParts.Append($"[{i}]{headers[i].Trim()}  ");
+            Add(new TextBox { Text = previewParts.ToString().TrimEnd(),
+                Location = new Point(14, 58), Size = new Size(400, 50),
+                Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Horizontal,
+                BackColor = Color.FromArgb(250, 250, 250),
+                Font = new Font("Consolas", 8f), BorderStyle = BorderStyle.FixedSingle,
+                WordWrap = false });
+ 
+            Add(new Label { Text = "Select the 0-based column index for each field:",
+                Location = new Point(14, 118), Size = new Size(400, 18) });
+ 
+            // ── Spinners ────────────────────────────────────────────────────
+            int sy = 142;
+            var numX = Spin("X  (right)",  defX,  14, sy);
+            var numY = Spin("Y  (up)",     defY, 148, sy);
+            var numZ = Spin("Z  (depth)",  defZ, 282, sy);
+            sy += 66;
+            var numU = Spin("U  (tex-X)",  defU,  14, sy);
+            var numV = Spin("V  (tex-Y)",  defV, 148, sy);
+ 
+            // ── Header checkbox ─────────────────────────────────────────────
+            var chkHdr = new CheckBox { Text = "First row is a header (skip it)",
+                Checked = defHdr, Location = new Point(14, sy + 54), AutoSize = true };
+            Add(chkHdr);
+ 
+            // ── Info tip ────────────────────────────────────────────────────
+            Add(new Label { Text = "Z is mirrored  •  V is flipped automatically.",
+                Location = new Point(14, sy + 80), Size = new Size(400, 18),
+                ForeColor = Color.FromArgb(110, 110, 110) });
+ 
+            // ── Buttons ─────────────────────────────────────────────────────
+            int by = ClientSize.Height - 50;
+            var okBtn  = Btn("Load",   14,  by, 190);
+            var canBtn = Btn("Cancel", 218, by, 196);
+ 
+            okBtn.Click += (s, e) =>
+            {
+                ColX = (int)numX.Value; ColY = (int)numY.Value; ColZ = (int)numZ.Value;
+                ColU = (int)numU.Value; ColV = (int)numV.Value;
+                HasHeader = chkHdr.Checked;
+                Confirmed = true;
+                Close();
+            };
+            canBtn.Click += (s, e) => { Confirmed = false; Close(); };
+            AcceptButton = okBtn;
+        }
+ 
+        private void Add(Control c) { c.BackColor = c.BackColor; Controls.Add(c); }
+ 
+        private NumericUpDown Spin(string label, int def, int x, int y)
+        {
+            Controls.Add(new Label { Text = label, Location = new Point(x, y),
+                Size = new Size(125, 16), BackColor = BG });
+            var n = new NumericUpDown { Minimum = 0, Maximum = 999, Value = def,
+                Location = new Point(x, y + 20), Size = new Size(120, 24),
+                BorderStyle = BorderStyle.FixedSingle };
+            Controls.Add(n); return n;
+        }
+ 
+        private Button Btn(string text, int x, int y, int width)
+        {
+            var b = new Button { Text = text, Location = new Point(x, y),
+                Size = new Size(width, 32), FlatStyle = FlatStyle.Flat, BackColor = IDLE };
+            b.FlatAppearance.BorderColor = BORD;
+            b.MouseEnter += (s, e) => b.BackColor = Color.FromArgb(229, 241, 251);
+            b.MouseLeave += (s, e) => b.BackColor = IDLE;
+            b.MouseDown  += (s, e) => b.BackColor = PRESS;
+            Controls.Add(b); return b;
+        }
+    }
  
 // =============================================================================
 //  THE ENDING - PROGRAM ENTRY POINT
