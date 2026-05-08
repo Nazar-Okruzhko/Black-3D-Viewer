@@ -102,6 +102,14 @@ vec3 shade(vec3 lp, vec3 lc, vec3 norm, vec3 vd,
 void main()
 {
     if (shadingMode == 1) { FragColor = vec4(0.86, 0.86, 0.86, 1.0); return; }
+    if (shadingMode == 3) {
+        // Dark-blue = front-facing (normals pointing outward)
+        // Red       = back-facing  (normals pointing inward)
+        FragColor = gl_FrontFacing
+            ? vec4(0.10, 0.15, 0.65, 1.0)
+            : vec4(0.75, 0.08, 0.08, 1.0);
+        return;
+    }
  
     vec3 albedo = solidColor;
     if (hasColorMap != 0) albedo = texture(colorMap, TexCoord).rgb;
@@ -262,7 +270,20 @@ void main() { FragColor = vec4(color, 1.0); }
                     case ".nr":  (v, uv, n, f, bMin, bMax) = NR2Loader.Load(path); break;
                     case ".glb": (v, uv, n, f, bMin, bMax) = GlbLoader.Load(path); break;
                     case ".dae": (v, uv, n, f, bMin, bMax) = DaeLoader.Load(path); break;
-                    case ".fbx": (v, uv, n, f, bMin, bMax) = FbxLoader.Load(path); break;
+                    case ".fbx":
+                        // Detect binary vs ASCII by magic header
+                        (v, uv, n, f, bMin, bMax) = IsFbxBinary(path)
+                            ? FbxBinaryLoader.Load(path)
+                            : FbxLoader.Load(path);
+                        break;
+                    case ".ply": (v, uv, n, f, bMin, bMax) = PlyLoader.Load(path); break;
+                    case ".smd": (v, uv, n, f, bMin, bMax) = SmdLoader.Load(path); break;
+                    case ".mdl": (v, uv, n, f, bMin, bMax) = MdlLoader.Load(path); break;
+                    case ".3ds": (v, uv, n, f, bMin, bMax) = ThreeDsLoader.Load(path); break;
+                    case ".max":
+                        throw new Exception(
+                            "Autodesk MAX (.max) is a proprietary binary format and cannot be opened without the 3ds Max SDK.\n" +
+                            "Please export your scene as FBX, OBJ, or 3DS from within 3ds Max.");
                     default:
                         MessageBox.Show($"Unsupported format: {ext}", "Load Error",
                             MessageBoxButtons.OK, MessageBoxIcon.Warning); return;
@@ -285,6 +306,21 @@ void main() { FragColor = vec4(color, 1.0); }
             if (ext == ".obj") LoadMtl(path);
             else               TryAutoTex(path);
             BuildBuffers();
+        }
+ 
+        // Returns true when the file starts with the Kaydara FBX Binary magic string
+        private static bool IsFbxBinary(string path)
+        {
+            try
+            {
+                using (var fs = File.OpenRead(path))
+                {
+                    var buf = new byte[18];
+                    fs.Read(buf, 0, 18);
+                    return System.Text.Encoding.ASCII.GetString(buf, 0, 18) == "Kaydara FBX Binary";
+                }
+            }
+            catch { return false; }
         }
  
         public float   GetSize()   => Math.Max(Math.Max(BoundsMax.X - BoundsMin.X, BoundsMax.Y - BoundsMin.Y), BoundsMax.Z - BoundsMin.Z);
@@ -731,7 +767,7 @@ void main() { FragColor = vec4(color, 1.0); }
         private bool showCube  = true;
         private int  shadeMode = 0;   // 0=solid 1=wire 2=tex
         private int  texSlot   = 0;
-        private bool showUV, showGrid = true, showAxes, showTexPreview;
+        private bool showUV, showGrid = true, showAxes, showNormals;
         private bool darkTheme = false;   // false = light (default), true = dark
         private Vector3 cachedCenter = Vector3.Zero;
         private float   cachedSize   = 5f;
@@ -740,10 +776,17 @@ void main() { FragColor = vec4(color, 1.0); }
         private Shader mainShader, wireShader;
         private int cubeVAO, cubeVBO;
  
+        // -- Loaded model tracking --
+        private string _loadedModelName = null;  // base name without extension
+ 
         // -- UV / texture preview cache --
-        private Bitmap uvCache;
-        private Bitmap texPreviewBmp;
-        private bool   uvDirty = true;
+        private Bitmap   uvCache;
+        private Bitmap   _checkerBmp;               // checker background (cached per panel size)
+        private Bitmap[] _slotBmps = new Bitmap[6]; // per-slot CPU bitmaps for preview panel
+        private bool     uvDirty   = true;
+        // -- UV overlay transition (0=hidden, 1=fully visible) --
+        private float _uvT      = 0f;
+        private float _uvTarget = 0f;
         // -- Texture hot-reload: poll LastWriteTime every 500 ms (works with all editors) --
         private readonly string[]   _hotPaths     = new string[6];
         private readonly DateTime[] _hotLastWrite = new DateTime[6];
@@ -861,7 +904,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 BackColor = Color.FromArgb(30,  30,  30),  BorderStyle = BorderStyle.FixedSingle
             };
             previewPanel.Paint  += OnUVPaint;
-            previewPanel.Resize += (s, e) => { uvDirty = true; previewPanel.Invalidate(); };
+            previewPanel.Resize += (s, e) => { uvDirty = true; _checkerBmp?.Dispose(); _checkerBmp = null; previewPanel.Invalidate(); };
             statsShadingTab.Controls.Add(previewPanel); y += 280;
  
             // Shading
@@ -897,20 +940,22 @@ void main() { FragColor = vec4(color, 1.0); }
             axesBtn = SBtn(statsShadingTab, "Show Axes", ref y);
             axesBtn.Click += (s, e) => { showAxes = !showAxes; axesBtn.BackColor = showAxes ? PRESS : IDLE; glControl.Invalidate(); };
  
-            showTexBtn = SBtn(statsShadingTab, "Show Texture", ref y);
+            showTexBtn = SBtn(statsShadingTab, "Show Normals", ref y);
             showTexBtn.Click += (s, e) =>
             {
-                showTexPreview = !showTexPreview;
-                showTexBtn.BackColor = showTexPreview ? PRESS : IDLE;
-                previewPanel.Invalidate();
+                showNormals = !showNormals;
+                showTexBtn.BackColor = showNormals ? PRESS : IDLE;
+                glControl.Invalidate();
             };
  
             uvBtn = SBtn(statsShadingTab, "Show UV Preview", ref y);
             uvBtn.Click += (s, e) =>
             {
-                showUV = !showUV;
+                showUV    = !showUV;
+                _uvTarget = showUV ? 1f : 0f;
                 uvBtn.BackColor = showUV ? PRESS : IDLE;
-                if (showUV) { uvDirty = true; }
+                uvDirty   = true;
+                _themeTimer.Start();   // reuses animation timer for UV fade
                 previewPanel.Invalidate();
             };
             y += 12;
@@ -984,9 +1029,18 @@ void main() { FragColor = vec4(color, 1.0); }
             _themeTimer.Tick += (s, e) =>
             {
                 float step = 0.06f;
+                // Theme transition
                 float diff = _themeTarget - _themeT;
-                if (Math.Abs(diff) <= step) { _themeT = _themeTarget; _themeTimer.Stop(); }
-                else                          _themeT += diff > 0 ? step : -step;
+                if (Math.Abs(diff) <= step) _themeT = _themeTarget;
+                else                        _themeT += diff > 0 ? step : -step;
+                // UV overlay transition
+                float uvDiff = _uvTarget - _uvT;
+                if (Math.Abs(uvDiff) <= step) _uvT = _uvTarget;
+                else                          _uvT += uvDiff > 0 ? step : -step;
+                // Stop when both animations are complete
+                if (Math.Abs(_themeTarget - _themeT) < 0.001f &&
+                    Math.Abs(_uvTarget    - _uvT)    < 0.001f)
+                    _themeTimer.Stop();
                 previewPanel.Invalidate();
                 glControl.Invalidate();
             };
@@ -1075,7 +1129,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetVec3("color", new Vector3(0.86f, 0.86f, 0.86f));
                 DrawMesh();
  
-                // Line pass (black edges) – slightly thicker to survive MSAA
+                // Line pass (black edges) � slightly thicker to survive MSAA
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
                 GL.LineWidth(1.6f);
                 wireShader.SetVec3("color", darkTheme ? new Vector3(0.08f, 0.08f, 0.08f) : new Vector3(0.05f, 0.05f, 0.05f));
@@ -1104,7 +1158,7 @@ void main() { FragColor = vec4(color, 1.0); }
                     GL.DrawElements(PrimitiveType.Triangles, 36, DrawElementsType.UnsignedInt, 0);
                     GL.BindVertexArray(0);
                 }
-                else model?.Render(mainShader, shadeMode);
+                else model?.Render(mainShader, showNormals ? 3 : shadeMode);
             }
  
             // -- Grid & Axes ? always at world origin (0,0,0) --
@@ -1193,25 +1247,53 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void OnUVPaint(object sender, PaintEventArgs e)
         {
-            // Always dark background regardless of app theme
-            e.Graphics.Clear(Color.FromArgb(30, 30, 30));
+            var g  = e.Graphics;
+            int pw = previewPanel.Width, ph = previewPanel.Height;
  
-            if (!showUV || model == null || model.TexCoords.Count == 0)
+            // 1. Always draw checker background (shows through transparent areas of the texture)
+            var cb = GetCheckerBmp(pw, ph);
+            if (cb != null) g.DrawImage(cb, 0, 0);
+ 
+            if (model == null)
             {
                 using (var f = new Font("Segoe UI", 9))
-                    e.Graphics.DrawString("No UV data", f, Brushes.Gray, 10, 10);
+                    g.DrawString("No model loaded", f, Brushes.DimGray, 10, 10);
                 return;
             }
  
-            // Rebuild the cached bitmap only once (when model changes or panel resizes)
-            if (uvDirty || uvCache == null)
+            // 2. Draw the texture of the active slot (if loaded), stretched to fill panel
+            Bitmap slotBmp = GetOrLoadSlotBitmap(texSlot);
+            if (slotBmp != null)
             {
-                RebuildUVCache();
-                uvDirty = false;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+                g.DrawImage(slotBmp, 0, 0, pw, ph);
             }
  
-            if (uvCache != null)
-                e.Graphics.DrawImage(uvCache, 0, 0);
+            // 3. Draw UV wireframe overlay with animated fade (fades in/out via _uvT)
+            if (_uvT > 0.001f && model.TexCoords.Count > 0)
+            {
+                if (uvDirty || uvCache == null) { RebuildUVCache(); uvDirty = false; }
+                if (uvCache != null)
+                {
+                    using (var ia = new System.Drawing.Imaging.ImageAttributes())
+                    {
+                        var cm = new System.Drawing.Imaging.ColorMatrix();
+                        cm.Matrix33 = _uvT;   // controls alpha of the overlay
+                        ia.SetColorMatrix(cm);
+                        g.DrawImage(uvCache,
+                            new Rectangle(0, 0, pw, ph),
+                            0, 0, uvCache.Width, uvCache.Height,
+                            GraphicsUnit.Pixel, ia);
+                    }
+                }
+            }
+ 
+            // 4. Info text when nothing at all is visible
+            if (slotBmp == null && _uvT <= 0.001f)
+            {
+                using (var f = new Font("Segoe UI", 9))
+                    g.DrawString("No texture loaded", f, Brushes.DimGray, 10, 10);
+            }
         }
  
         private void RebuildUVCache()
@@ -1244,7 +1326,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 var borderColor = Color.FromArgb(95, 95, 95);
                 g.DrawRectangle(new Pen(borderColor, 1f), pad, pad, scale, scale);
  
-                // UV edges – always classic orange on dark
+                // UV edges � always classic orange on dark
                 var lineColor = Color.FromArgb(255, 165, 0);
                 using (var pen = new Pen(lineColor, 1f))
                 {
@@ -1268,6 +1350,57 @@ void main() { FragColor = vec4(color, 1.0); }
             uvCache = bmp;
         }
  
+        // -- Checker-board background bitmap (cached; recreated when panel resizes) ----------
+        private Bitmap GetCheckerBmp(int w, int h)
+        {
+            if (_checkerBmp != null && _checkerBmp.Width == w && _checkerBmp.Height == h)
+                return _checkerBmp;
+            _checkerBmp?.Dispose();
+            if (w <= 0 || h <= 0) { _checkerBmp = null; return null; }
+            int cell = 14;
+            _checkerBmp = new Bitmap(w, h);
+            using (var g = Graphics.FromImage(_checkerBmp))
+            using (var b1 = new SolidBrush(Color.FromArgb(195, 195, 195)))
+            using (var b2 = new SolidBrush(Color.FromArgb(122, 122, 122)))
+            {
+                for (int cx = 0; cx * cell < w; cx++)
+                for (int cy = 0; cy * cell < h; cy++)
+                {
+                    var br = (cx + cy) % 2 == 0 ? (Brush)b1 : b2;
+                    g.FillRectangle(br,
+                        cx * cell, cy * cell,
+                        Math.Min(cell, w - cx * cell),
+                        Math.Min(cell, h - cy * cell));
+                }
+            }
+            return _checkerBmp;
+        }
+ 
+        // -- Per-slot CPU bitmap for preview panel (lazy-loaded, cached until slot changes) ---
+        private Bitmap GetOrLoadSlotBitmap(int slot)
+        {
+            if (model == null || slot < 0 || slot >= 6) return null;
+            if (_slotBmps[slot] != null) return _slotBmps[slot];
+            string path = model.TexPaths[slot];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try
+            {
+                string ext = Path.GetExtension(path).ToLowerInvariant();
+                Bitmap bmp;
+                if      (ext == ".dds") bmp = model.LoadDDSPublic(path);
+                else if (ext == ".tga") bmp = model.LoadTGAPublic(path);
+                else                    bmp = new Bitmap(path);
+                _slotBmps[slot] = bmp;
+                return bmp;
+            }
+            catch { return null; }
+        }
+ 
+        private void ClearSlotBmps()
+        {
+            for (int i = 0; i < 6; i++) { _slotBmps[i]?.Dispose(); _slotBmps[i] = null; }
+        }
+ 
 // =============================================================================
 //  SECTION 9 - CAMERA & INPUT
 // =============================================================================
@@ -1279,7 +1412,7 @@ void main() { FragColor = vec4(color, 1.0); }
             if (keyData == Keys.Return || keyData == Keys.Enter)
             {
                 if (model != null) ExportOBJ();
-                return true; // consumed – do NOT forward to focused button
+                return true; // consumed � do NOT forward to focused button
             }
             return base.ProcessCmdKey(ref msg, keyData);
         }
@@ -1332,17 +1465,19 @@ void main() { FragColor = vec4(color, 1.0); }
             {
                 dlg.Title    = "Export OBJ";
                 dlg.Filter   = "Wavefront OBJ (*.obj)|*.obj";
-                dlg.FileName = "model.obj";
+                dlg.FileName = (string.IsNullOrEmpty(_loadedModelName) ? "model" : _loadedModelName) + ".obj";
                 if (dlg.ShowDialog() != DialogResult.OK) return;
  
                 string objPath  = dlg.FileName;
                 string dir      = Path.GetDirectoryName(objPath);
                 string baseName = Path.GetFileNameWithoutExtension(objPath);
-                string texDir   = Path.Combine(dir, baseName + "_textures");
+                // Texture folder named exactly after the model (e.g. export_dir/soldier/)
+                string texDir   = Path.Combine(dir, baseName);
  
                 // --- Export textures as PNG ---
-                string[] mtlKeys   = { "map_Kd","map_Bump","map_Ks","map_Pr","map_Pm","map_d" };
-                string[] texLabels = { "Color","Normal","Specular","Roughness","Metallic","Opacity" };
+                // Slot codes: _c=colour _n=normal _s=specular _r=roughness _m=metallic _o=opacity
+                string[] mtlKeys  = { "map_Kd","map_Bump","map_Ks","map_Pr","map_Pm","map_d" };
+                string[] texSuffix = { "_c", "_n", "_s", "_r", "_m", "_o" };
                 var exported = new Dictionary<int, string>();
                 for (int s = 0; s < 6; s++)
                 {
@@ -1351,7 +1486,7 @@ void main() { FragColor = vec4(color, 1.0); }
                     try
                     {
                         Directory.CreateDirectory(texDir);
-                        string outName = texLabels[s] + ".png";
+                        string outName = baseName + texSuffix[s] + ".png";
                         string ext2    = Path.GetExtension(src).ToLowerInvariant();
                         Bitmap bmp2 =
                             ext2 == ".dds" ? model.LoadDDSPublic(src) :
@@ -1374,20 +1509,21 @@ void main() { FragColor = vec4(color, 1.0); }
                 // --- Write MTL ---
                 string mtlName = baseName + ".mtl";
                 var mtl = new StringBuilder();
-                mtl.AppendLine("# Black3DViewer export");
-                mtl.AppendLine("newmtl mat0");
+                mtl.AppendLine("# Exported by HotDog 3D Viewer");
+                mtl.AppendLine($"newmtl {baseName}_mat");
                 mtl.AppendLine("Ka 1 1 1");  mtl.AppendLine("Kd 1 1 1");
                 mtl.AppendLine("Ks 0 0 0");  mtl.AppendLine("d 1");
                 foreach (var kv in exported)
-                    mtl.AppendLine($"{mtlKeys[kv.Key]} {baseName}_textures/{kv.Value}");
+                    mtl.AppendLine($"{mtlKeys[kv.Key]} {baseName}/{kv.Value}");
                 File.WriteAllText(Path.Combine(dir, mtlName), mtl.ToString(), Encoding.UTF8);
  
                 // --- Write OBJ ---
                 var sb = new StringBuilder();
-                sb.AppendLine("# Black3DViewer export");
+                sb.AppendLine("# Exported by HotDog 3D Viewer");
                 sb.AppendLine($"mtllib {mtlName}");
+                sb.AppendLine($"o {baseName}");
                 sb.AppendLine("g default");
-                sb.AppendLine("usemtl mat0");
+                sb.AppendLine($"usemtl {baseName}_mat");
                 sb.AppendLine();
                 foreach (var v  in model.Vertices)   sb.AppendLine($"v  {F(v.X)} {F(v.Y)} {F(v.Z)}");
                 sb.AppendLine();
@@ -1416,7 +1552,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
                 string msg = $"Saved:\n  {Path.GetFileName(objPath)}\n  {mtlName}";
                 if (exported.Count > 0)
-                    msg += $"\n  {exported.Count} texture(s) in {baseName}_textures/";
+                    msg += $"\n  {exported.Count} texture(s) \u2192 {baseName}/";
                 MessageBox.Show(msg, "Export Complete",
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
@@ -1533,7 +1669,8 @@ void main() { FragColor = vec4(color, 1.0); }
 // =============================================================================
  
         private static readonly HashSet<string> MODEL_EXT = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { ".obj", ".csv", ".stl", ".rip", ".nr", ".glb", ".dae", ".fbx" };
+            { ".obj", ".csv", ".stl", ".rip", ".nr", ".glb", ".dae", ".fbx",
+              ".ply", ".smd", ".mdl", ".3ds", ".max" };
  
         private static readonly HashSet<string> TEX_EXT = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { ".png", ".jpg", ".jpeg", ".bmp", ".dds", ".tga" };
@@ -1544,15 +1681,19 @@ void main() { FragColor = vec4(color, 1.0); }
             {
                 dlg.Title  = "Load 3D Model";
                 dlg.Filter =
-                    "All Supported (*.obj;*.csv;*.stl;*.rip;*.nr;*.glb;*.dae;*.fbx)|*.obj;*.csv;*.stl;*.rip;*.nr;*.glb;*.dae;*.fbx|" +
+                    "All Supported|*.obj;*.csv;*.stl;*.rip;*.nr;*.glb;*.dae;*.fbx;*.ply;*.smd;*.mdl;*.3ds|" +
                     "Wavefront OBJ (*.obj)|*.obj|" +
-                    "CSV Geometry (*.csv)|*.csv|" +
+                    "Stanford PLY (*.ply)|*.ply|" +
+                    "FBX � ASCII & Binary (*.fbx)|*.fbx|" +
+                    "Collada (*.dae)|*.dae|" +
+                    "glTF Binary (*.glb)|*.glb|" +
                     "STL (*.stl)|*.stl|" +
+                    "Valve SMD (*.smd)|*.smd|" +
+                    "Valve GoldSrc MDL (*.mdl)|*.mdl|" +
+                    "3D Studio (*.3ds)|*.3ds|" +
+                    "CSV Geometry (*.csv)|*.csv|" +
                     "NinjaRipper v1 (*.rip)|*.rip|" +
                     "NinjaRipper v2 (*.nr)|*.nr|" +
-                    "glTF Binary (*.glb)|*.glb|" +
-                    "Collada (*.dae)|*.dae|" +
-                    "FBX ASCII (*.fbx)|*.fbx|" +
                     "All Files (*.*)|*.*";
                 if (dlg.ShowDialog() == DialogResult.OK)
                     LoadFile(dlg.FileName);
@@ -1576,9 +1717,11 @@ void main() { FragColor = vec4(color, 1.0); }
             zoom         = -cachedSize * 1.8f;
             rotX = 0f; rotY = 0f;
             uvDirty = true;
-            texPreviewBmp?.Dispose(); texPreviewBmp = null;  // reload on next paint
+            ClearSlotBmps();   // reload previews on next paint
  
+            _loadedModelName = Path.GetFileNameWithoutExtension(path);
             loadedLabel.Text = Path.GetFileName(path);
+            Text = "HotDog � 3D Viewer  �  " + Path.GetFileName(path);
             RefreshShade();
             RefreshTexBtns();
             RefreshTexBtnEnabled();
@@ -1603,7 +1746,7 @@ void main() { FragColor = vec4(color, 1.0); }
             {
                 model.LoadTexture(f, texSlot);
                 TrackTexture(texSlot, f);
-                texPreviewBmp?.Dispose(); texPreviewBmp = null;
+                _slotBmps[texSlot]?.Dispose(); _slotBmps[texSlot] = null;
                 RefreshTexBtnEnabled();
                 UpdateNoTex();
                 previewPanel.Invalidate();
@@ -1615,7 +1758,7 @@ void main() { FragColor = vec4(color, 1.0); }
 //  SECTION 11 - UI STATE HELPERS
 // =============================================================================
  
-        private void SetSlot(int s) { texSlot = s; RefreshTexBtns(); UpdateNoTex(); glControl.Invalidate(); }
+        private void SetSlot(int s) { texSlot = s; RefreshTexBtns(); UpdateNoTex(); previewPanel.Invalidate(); glControl.Invalidate(); }
  
         private void RefreshShade()
         {
@@ -1679,13 +1822,13 @@ void main() { FragColor = vec4(color, 1.0); }
             _themeTimer?.Stop(); _themeTimer?.Dispose();
             model?.Cleanup();
             uvCache?.Dispose();
-            texPreviewBmp?.Dispose();
+            _checkerBmp?.Dispose(); ClearSlotBmps();
             if (cubeVAO != 0) GL.DeleteVertexArray(cubeVAO);
             if (cubeVBO != 0) GL.DeleteBuffer(cubeVBO);
         }
  
 // =============================================================================
-//  TEXTURE HOT-RELOAD  (polls LastWriteTime every 500 ms – works with all editors)
+//  TEXTURE HOT-RELOAD  (polls LastWriteTime every 500 ms � works with all editors)
 // =============================================================================
  
         // Register a path to be polled; call whenever a texture slot is loaded/changed.
@@ -1697,7 +1840,7 @@ void main() { FragColor = vec4(color, 1.0); }
                                   : File.GetLastWriteTimeUtc(path);
         }
  
-        // Runs on the UI thread via the WinForms timer – safe to touch GL here.
+        // Runs on the UI thread via the WinForms timer � safe to touch GL here.
         private void HotReloadTick(object sender, EventArgs e)
         {
             if (model == null) return;
@@ -1718,7 +1861,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 if (oldId >= 0) GL.DeleteTexture(oldId);
                 model.LoadTexture(path, s);
  
-                if (s == 0) { texPreviewBmp?.Dispose(); texPreviewBmp = null; }
+                _slotBmps[s]?.Dispose(); _slotBmps[s] = null;  // force preview refresh for this slot
  
                 RefreshTexBtnEnabled();
                 UpdateNoTex();
@@ -2603,6 +2746,732 @@ void main() { FragColor = vec4(color, 1.0); }
     }
  
  
+ 
+    // --------------------------------------------------------------------------
+    // PLY  Stanford Polygon Format  (ASCII + binary little/big endian)
+    // --------------------------------------------------------------------------
+    public static class PlyLoader
+    {
+        public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
+            Load(string path)
+        {
+            var verts = new List<Vector3>(); var uvs = new List<Vector2>();
+            var norms = new List<Vector3>(); var faces = new List<MeshFace>();
+            var bMin  = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
+            var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+ 
+            // -- Parse header -------------------------------------------------
+            string fmt = "ascii";
+            int nVerts = 0, nFaces = 0;
+            var vProps = new List<(string type, string name)>();
+            var fProps = new List<(string type, string name)>();
+            bool inVert = false, inFace = false;
+            long dataStart = 0;
+ 
+            using (var fs = File.OpenRead(path))
+            {
+                var hdr = new List<string>();
+                var tmp = new List<byte>();
+                int b;
+                while ((b = fs.ReadByte()) != -1)
+                {
+                    if (b == '\n')
+                    {
+                        string ln = System.Text.Encoding.ASCII.GetString(tmp.ToArray()).Trim();
+                        hdr.Add(ln); tmp.Clear();
+                        if (ln == "end_header") { dataStart = fs.Position; break; }
+                    }
+                    else if (b != '\r') tmp.Add((byte)b);
+                }
+ 
+                foreach (var ln in hdr)
+                {
+                    var p = ln.Split(new[]{' '}, StringSplitOptions.RemoveEmptyEntries);
+                    if (p.Length == 0) continue;
+                    if (p[0] == "format")     { fmt = p.Length > 1 ? p[1] : "ascii"; }
+                    else if (p[0] == "element")
+                    {
+                        inVert = p.Length > 1 && p[1] == "vertex"; inFace = p.Length > 1 && p[1] == "face";
+                        if (inVert && p.Length > 2) int.TryParse(p[2], out nVerts);
+                        if (inFace && p.Length > 2) int.TryParse(p[2], out nFaces);
+                    }
+                    else if (p[0] == "property")
+                    {
+                        if (inVert && p.Length >= 3) vProps.Add((p[1], p[p.Length - 1].ToLower()));
+                        else if (inFace && p.Length >= 3) fProps.Add((p[1] == "list" ? "list" : p[1], p.Length > 3 ? p[3] : p[2]));
+                    }
+                }
+            }
+ 
+            // Map vertex property names ? indices
+            int xi=-1,yi=-1,zi=-1,nxi=-1,nyi=-1,nzi=-1,si=-1,ti=-1;
+            for (int i = 0; i < vProps.Count; i++)
+            {
+                switch (vProps[i].name) {
+                    case "x":  xi=i; break; case "y": yi=i; break; case "z": zi=i; break;
+                    case "nx": nxi=i;break; case "ny":nyi=i;break; case "nz":nzi=i;break;
+                    case "s": case "u": si=i; break;
+                    case "t": case "v": ti=i; break;
+                }
+            }
+ 
+            bool ascii = fmt == "ascii";
+            bool bigEndian = fmt == "binary_big_endian";
+ 
+            using (var fs = File.OpenRead(path))
+            {
+                fs.Seek(dataStart, SeekOrigin.Begin);
+                using (var br = new BinaryReader(fs))
+                {
+                    if (ascii)
+                    {
+                        // -- ASCII read ----------------------------------------
+                        using (var sr = new StreamReader(fs, System.Text.Encoding.ASCII, false, 4096, true))
+                        {
+                            for (int vi = 0; vi < nVerts; vi++)
+                            {
+                                var tok = (sr.ReadLine() ?? "").Trim().Split(new[]{' ','\t'}, StringSplitOptions.RemoveEmptyEntries);
+                                float[] vals = new float[tok.Length];
+                                for (int k = 0; k < tok.Length; k++) FloatTryParse(tok[k], out vals[k]);
+                                var vert = new Vector3(xi>=0?vals[xi]:0, yi>=0?vals[yi]:0, zi>=0?vals[zi]:0);
+                                verts.Add(vert); bMin = Vector3.ComponentMin(bMin, vert); bMax = Vector3.ComponentMax(bMax, vert);
+                                if (nxi>=0 && nyi>=0 && nzi>=0) norms.Add(new Vector3(vals[nxi],vals[nyi],vals[nzi]));
+                                uvs.Add(si>=0&&ti>=0 ? new Vector2(vals[si],vals[ti]) : Vector2.Zero);
+                            }
+                            for (int fi = 0; fi < nFaces; fi++)
+                            {
+                                var tok = (sr.ReadLine() ?? "").Trim().Split(new[]{' ','\t'}, StringSplitOptions.RemoveEmptyEntries);
+                                if (tok.Length < 1) continue;
+                                int cnt; int.TryParse(tok[0], out cnt);
+                                int[] idx = new int[cnt];
+                                for (int k = 0; k < cnt && k+1 < tok.Length; k++) int.TryParse(tok[k+1], out idx[k]);
+                                for (int k = 1; k < cnt-1; k++)
+                                    faces.Add(new MeshFace(new[]{idx[0],idx[k],idx[k+1]},
+                                                           new[]{idx[0],idx[k],idx[k+1]},
+                                                           new[]{norms.Count>0?idx[0]:-1, norms.Count>0?idx[k]:-1, norms.Count>0?idx[k+1]:-1}));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // -- Binary read ---------------------------------------
+                        for (int vi = 0; vi < nVerts; vi++)
+                        {
+                            float[] vals = new float[vProps.Count];
+                            for (int k = 0; k < vProps.Count; k++)
+                                vals[k] = ReadPlyFloat(br, vProps[k].type, bigEndian);
+                            var vert = new Vector3(xi>=0?vals[xi]:0, yi>=0?vals[yi]:0, zi>=0?vals[zi]:0);
+                            verts.Add(vert); bMin = Vector3.ComponentMin(bMin, vert); bMax = Vector3.ComponentMax(bMax, vert);
+                            if (nxi>=0&&nyi>=0&&nzi>=0) norms.Add(new Vector3(vals[nxi],vals[nyi],vals[nzi]));
+                            uvs.Add(si>=0&&ti>=0 ? new Vector2(vals[si],vals[ti]) : Vector2.Zero);
+                        }
+                        for (int fi = 0; fi < nFaces; fi++)
+                        {
+                            // First property is list: read count then indices
+                            int cnt = (int)ReadPlyUInt(br, fProps.Count>0&&fProps[0].type=="list" ? "uchar" : "uchar", bigEndian);
+                            int[] idx = new int[cnt];
+                            for (int k = 0; k < cnt; k++) idx[k] = (int)ReadPlyUInt(br, "int", bigEndian);
+                            for (int k = 1; k < cnt-1; k++)
+                                faces.Add(new MeshFace(new[]{idx[0],idx[k],idx[k+1]},
+                                                       new[]{idx[0],idx[k],idx[k+1]},
+                                                       new[]{norms.Count>0?idx[0]:-1, norms.Count>0?idx[k]:-1, norms.Count>0?idx[k+1]:-1}));
+                        }
+                    }
+                }
+            }
+            return (verts, uvs, norms, faces, bMin, bMax);
+        }
+ 
+        static float ReadPlyFloat(BinaryReader br, string t, bool big)
+        {
+            switch (t) {
+                case "float": case "float32": { var b=br.ReadBytes(4); if(big)Array.Reverse(b); return BitConverter.ToSingle(b,0); }
+                case "double": case "float64": { var b=br.ReadBytes(8); if(big)Array.Reverse(b); return (float)BitConverter.ToDouble(b,0); }
+                default: return (float)ReadPlyUInt(br, t, big);
+            }
+        }
+        static uint ReadPlyUInt(BinaryReader br, string t, bool big)
+        {
+            switch (t) {
+                case "uchar": case "uint8":  return br.ReadByte();
+                case "char":  case "int8":   return (uint)br.ReadSByte();
+                case "ushort":case "uint16": { var b=br.ReadBytes(2); if(big)Array.Reverse(b); return BitConverter.ToUInt16(b,0); }
+                case "short": case "int16":  { var b=br.ReadBytes(2); if(big)Array.Reverse(b); return (uint)BitConverter.ToInt16(b,0); }
+                case "int":   case "int32":  { var b=br.ReadBytes(4); if(big)Array.Reverse(b); return (uint)BitConverter.ToInt32(b,0); }
+                case "uint":  case "uint32": { var b=br.ReadBytes(4); if(big)Array.Reverse(b); return BitConverter.ToUInt32(b,0); }
+                default: return 0;
+            }
+        }
+        static void FloatTryParse(string s, out float v) =>
+            float.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out v);
+    }
+ 
+    // --------------------------------------------------------------------------
+    // SMD  Valve Source Model Data  (ASCII reference-mesh format)
+    // --------------------------------------------------------------------------
+    public static class SmdLoader
+    {
+        public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
+            Load(string path)
+        {
+            var verts = new List<Vector3>(); var uvs = new List<Vector2>();
+            var norms = new List<Vector3>(); var faces = new List<MeshFace>();
+            var bMin  = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
+            var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+ 
+            var lines = File.ReadAllLines(path);
+            bool inTri = false;
+            int triLine = 0;   // 0=material, 1/2/3=vertices
+            int[] vi3 = new int[3];
+ 
+            for (int li = 0; li < lines.Length; li++)
+            {
+                var raw = lines[li].Trim();
+                if (raw.Length == 0 || raw.StartsWith("//")) continue;
+ 
+                if (raw == "triangles") { inTri = true; triLine = 0; continue; }
+                if (raw == "end")       { inTri = false; triLine = 0; continue; }
+                if (!inTri) continue;
+ 
+                if (triLine == 0) { triLine = 1; continue; } // material line, skip
+ 
+                var tok = raw.Split(new[]{' ','\t'}, StringSplitOptions.RemoveEmptyEntries);
+                // format: bone  x y z  nx ny nz  u v  [links...]
+                if (tok.Length < 9) { triLine = 1; continue; }
+ 
+                float x  = F(tok[1]), y  = F(tok[2]),  z  = F(tok[3]);
+                float nx = F(tok[4]), ny = F(tok[5]),  nz = F(tok[6]);
+                float u  = F(tok[7]), tv = F(tok[8]);
+ 
+                var vert = new Vector3(x, y, z);
+                int idx = verts.Count;
+                verts.Add(vert); uvs.Add(new Vector2(u, tv)); norms.Add(new Vector3(nx, ny, nz));
+                bMin = Vector3.ComponentMin(bMin, vert); bMax = Vector3.ComponentMax(bMax, vert);
+                vi3[triLine - 1] = idx;
+                triLine++;
+ 
+                if (triLine == 4)
+                {
+                    faces.Add(new MeshFace(new[]{vi3[0],vi3[1],vi3[2]},
+                                           new[]{vi3[0],vi3[1],vi3[2]},
+                                           new[]{vi3[0],vi3[1],vi3[2]}));
+                    triLine = 1;
+                }
+            }
+            return (verts, uvs, norms, faces, bMin, bMax);
+        }
+        static float F(string s) {
+            float.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out float v); return v;
+        }
+    }
+ 
+    // --------------------------------------------------------------------------
+    // MDL  Valve GoldSrc (Half-Life 1) compiled model  � geometry only
+    // --------------------------------------------------------------------------
+    public static class MdlLoader
+    {
+        const int IDST = 0x54534449; // "IDST"
+ 
+        public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
+            Load(string path)
+        {
+            var verts = new List<Vector3>(); var uvs = new List<Vector2>();
+            var norms = new List<Vector3>(); var faces = new List<MeshFace>();
+            var bMin  = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
+            var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+ 
+            byte[] data = File.ReadAllBytes(path);
+            if (data.Length < 244) throw new Exception("File too small to be a GoldSrc MDL.");
+            if (BitConverter.ToInt32(data, 0) != IDST) throw new Exception("Not a GoldSrc MDL (bad magic). Source Engine MDL is not supported.");
+            int version = BitConverter.ToInt32(data, 4);
+            if (version != 10) throw new Exception($"Unsupported MDL version {version}. Only GoldSrc v10 is supported.");
+ 
+            // studiohdr_t offsets (all int32)
+            int numTextures   = I32(data, 180), texOff    = I32(data, 184);
+            int numBodyParts  = I32(data, 204), bpOff     = I32(data, 208);
+ 
+            // Collect texture dimensions for UV scaling
+            var texWidths  = new int[Math.Max(1, numTextures)];
+            var texHeights = new int[Math.Max(1, numTextures)];
+            for (int ti = 0; ti < numTextures; ti++)
+            {
+                int tBase = texOff + ti * 80;
+                if (tBase + 80 > data.Length) break;
+                texWidths[ti]  = I32(data, tBase + 64);
+                texHeights[ti] = I32(data, tBase + 68);
+            }
+ 
+            // Walk: bodyparts ? models ? meshes
+            for (int bpi = 0; bpi < numBodyParts; bpi++)
+            {
+                int bpBase    = bpOff + bpi * 76;
+                if (bpBase + 76 > data.Length) break;
+                int numModels = I32(data, bpBase + 64);
+                int modelOff  = I32(data, bpBase + 68) + bpBase; // relative to bodypart
+ 
+                // Actually the offset is absolute in the file
+                modelOff = I32(data, bpBase + 68);
+ 
+                for (int mi = 0; mi < numModels; mi++)
+                {
+                    // mstudiomodel_t = 112 bytes
+                    int mBase    = modelOff + mi * 112;
+                    if (mBase + 112 > data.Length) break;
+                    int numMesh  = I32(data, mBase + 68);
+                    int meshOff  = I32(data, mBase + 72);
+                    int numVert  = I32(data, mBase + 76);
+                    int vertOff  = I32(data, mBase + 84);   // vec3 array
+                    int normOff  = I32(data, mBase + 100);  // vec3 array
+ 
+                    // Read model-local vertices and normals
+                    var mVerts = new List<Vector3>();
+                    var mNorms = new List<Vector3>();
+                    for (int vi = 0; vi < numVert; vi++)
+                    {
+                        int vo = vertOff + vi * 12;
+                        if (vo + 12 > data.Length) break;
+                        mVerts.Add(new Vector3(F32(data,vo), F32(data,vo+4), F32(data,vo+8)));
+                    }
+                    int numNorm = I32(data, mBase + 92);
+                    for (int ni = 0; ni < numNorm; ni++)
+                    {
+                        int no = normOff + ni * 12;
+                        if (no + 12 > data.Length) break;
+                        mNorms.Add(new Vector3(F32(data,no), F32(data,no+4), F32(data,no+8)));
+                    }
+ 
+                    for (int meshi = 0; meshi < numMesh; meshi++)
+                    {
+                        // mstudiomesh_t = 20 bytes
+                        int meshBase = meshOff + meshi * 20;
+                        if (meshBase + 20 > data.Length) break;
+                        int triOff   = I32(data, meshBase + 4);
+                        int skinRef  = I32(data, meshBase + 8);
+ 
+                        int tw = skinRef < texWidths.Length  ? texWidths[skinRef]  : 256;
+                        int th = skinRef < texHeights.Length ? texHeights[skinRef] : 256;
+ 
+                        // Read triangle strip/fan data
+                        int tPos = triOff;
+                        while (tPos + 2 <= data.Length)
+                        {
+                            short cmd = BitConverter.ToInt16(data, tPos); tPos += 2;
+                            if (cmd == 0) break;
+                            bool isFan = cmd > 0;
+                            int  cnt   = Math.Abs(cmd);
+                            var  strip = new List<(int vi, int ni, float u, float v)>();
+                            for (int si = 0; si < cnt && tPos + 8 <= data.Length; si++, tPos += 8)
+                            {
+                                int  svi = BitConverter.ToInt16(data, tPos);
+                                int  sni = BitConverter.ToInt16(data, tPos + 2);
+                                float su = BitConverter.ToInt16(data, tPos + 4) / (float)tw;
+                                float sv = BitConverter.ToInt16(data, tPos + 6) / (float)th;
+                                strip.Add((svi, sni, su, sv));
+                            }
+ 
+                            // Triangulate strip or fan
+                            int baseIdx = verts.Count;
+                            foreach (var (svi,sni,su,sv) in strip)
+                            {
+                                var wv = svi < mVerts.Count ? mVerts[svi] : Vector3.Zero;
+                                verts.Add(wv); uvs.Add(new Vector2(su,sv));
+                                norms.Add(sni < mNorms.Count ? mNorms[sni] : Vector3.UnitY);
+                                bMin = Vector3.ComponentMin(bMin,wv); bMax = Vector3.ComponentMax(bMax,wv);
+                            }
+                            for (int si = 2; si < strip.Count; si++)
+                            {
+                                int a = baseIdx, b = baseIdx + si - 1, c = baseIdx + si;
+                                if (!isFan && (si & 1) == 1) { int tmp=b; b=c; c=tmp; }
+                                else if (isFan) a = baseIdx;
+                                faces.Add(new MeshFace(new[]{a,b,c},new[]{a,b,c},new[]{a,b,c}));
+                            }
+                        }
+                    }
+                }
+            }
+            return (verts, uvs, norms, faces, bMin, bMax);
+        }
+        static int   I32(byte[] d, int o) => BitConverter.ToInt32(d, o);
+        static float F32(byte[] d, int o) => BitConverter.ToSingle(d, o);
+    }
+ 
+    // --------------------------------------------------------------------------
+    // 3DS  Autodesk 3D Studio binary chunk format (.3ds)
+    // --------------------------------------------------------------------------
+    public static class ThreeDsLoader
+    {
+        const ushort MAIN3DS=0x4D4D, EDIT3DS=0x3D3D, OBJECT=0x4000,
+                     TRIMESH=0x4100, VERTLIST=0x4110, FACELIST=0x4120, MAPLIST=0x4140;
+ 
+        public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
+            Load(string path)
+        {
+            var verts = new List<Vector3>(); var uvs = new List<Vector2>();
+            var norms = new List<Vector3>(); var faces = new List<MeshFace>();
+            var bMin  = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
+            var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+ 
+            byte[] data = File.ReadAllBytes(path);
+            if (data.Length < 6 || BitConverter.ToUInt16(data,0) != MAIN3DS)
+                throw new Exception("Not a valid .3DS file.");
+ 
+            ParseChunks(data, 6, data.Length, verts, uvs, norms, faces, ref bMin, ref bMax);
+            return (verts, uvs, norms, faces, bMin, bMax);
+        }
+ 
+        static void ParseChunks(byte[] d, int pos, int end,
+            List<Vector3> verts, List<Vector2> uvs, List<Vector3> norms,
+            List<MeshFace> faces, ref Vector3 bMin, ref Vector3 bMax)
+        {
+            while (pos + 6 <= end)
+            {
+                ushort id  = BitConverter.ToUInt16(d, pos);
+                int    len = BitConverter.ToInt32(d, pos + 2);
+                if (len < 6) break;
+                int chunkEnd = Math.Min(pos + len, end);
+                int dataStart = pos + 6;
+ 
+                switch (id)
+                {
+                    case EDIT3DS:
+                        ParseChunks(d, dataStart, chunkEnd, verts, uvs, norms, faces, ref bMin, ref bMax);
+                        break;
+                    case OBJECT:
+                        // Skip object name (null-terminated) then recurse
+                        int nameEnd = dataStart;
+                        while (nameEnd < chunkEnd && d[nameEnd] != 0) nameEnd++;
+                        ParseChunks(d, nameEnd + 1, chunkEnd, verts, uvs, norms, faces, ref bMin, ref bMax);
+                        break;
+                    case TRIMESH:
+                        ParseChunks(d, dataStart, chunkEnd, verts, uvs, norms, faces, ref bMin, ref bMax);
+                        break;
+                    case VERTLIST:
+                    {
+                        int cnt = BitConverter.ToUInt16(d, dataStart);
+                        int p2 = dataStart + 2;
+                        for (int i = 0; i < cnt && p2 + 12 <= chunkEnd; i++, p2 += 12)
+                        {
+                            var vt = new Vector3(BitConverter.ToSingle(d,p2), BitConverter.ToSingle(d,p2+8), -BitConverter.ToSingle(d,p2+4));
+                            verts.Add(vt); uvs.Add(Vector2.Zero);
+                            bMin = Vector3.ComponentMin(bMin,vt); bMax = Vector3.ComponentMax(bMax,vt);
+                        }
+                        break;
+                    }
+                    case FACELIST:
+                    {
+                        int cnt = BitConverter.ToUInt16(d, dataStart);
+                        int p2 = dataStart + 2;
+                        int vBase = verts.Count - (chunkEnd > 0 ? 0 : 0); // face indices are local to this mesh
+                        // Find the vertex base for this mesh by tracking previously added verts
+                        // (3DS face indices are 0-based within this mesh block, which already added verts above)
+                        // We compute base as: total verts minus the count from the preceding VERTLIST
+                        // Approximation: use 0-based into whatever was loaded most recently
+                        for (int i = 0; i < cnt && p2 + 8 <= chunkEnd; i++, p2 += 8)
+                        {
+                            int a = BitConverter.ToUInt16(d,p2);
+                            int b = BitConverter.ToUInt16(d,p2+2);
+                            int c = BitConverter.ToUInt16(d,p2+4);
+                            faces.Add(new MeshFace(new[]{a,b,c},new[]{a,b,c},new[]{-1,-1,-1}));
+                        }
+                        break;
+                    }
+                    case MAPLIST:
+                    {
+                        int cnt = BitConverter.ToUInt16(d, dataStart);
+                        int p2 = dataStart + 2;
+                        // Replace the last 'cnt' UV entries (added by the VERTLIST before this)
+                        int uvStart = uvs.Count - cnt;
+                        for (int i = 0; i < cnt && p2 + 8 <= chunkEnd; i++, p2 += 8)
+                        {
+                            float u = BitConverter.ToSingle(d,p2), tv = BitConverter.ToSingle(d,p2+4);
+                            if (uvStart + i >= 0 && uvStart + i < uvs.Count)
+                                uvs[uvStart + i] = new Vector2(u, tv);
+                        }
+                        break;
+                    }
+                }
+                pos = chunkEnd;
+            }
+        }
+    }
+ 
+    // --------------------------------------------------------------------------
+    // FBX Binary  (Kaydara FBX Binary 7.x)
+    // Parses the node tree, finds Geometry nodes and extracts:
+    //   Vertices, PolygonVertexIndex, LayerElementNormal, LayerElementUV
+    // --------------------------------------------------------------------------
+    public static class FbxBinaryLoader
+    {
+        public static (List<Vector3> v, List<Vector2> uv, List<Vector3> n, List<MeshFace> f, Vector3 bMin, Vector3 bMax)
+            Load(string path)
+        {
+            var verts = new List<Vector3>(); var uvs = new List<Vector2>();
+            var norms = new List<Vector3>(); var faces = new List<MeshFace>();
+            var bMin  = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
+            var bMax  = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+ 
+            byte[] data = File.ReadAllBytes(path);
+            // Validate magic
+            if (data.Length < 27 || System.Text.Encoding.ASCII.GetString(data,0,18) != "Kaydara FBX Binary")
+                throw new Exception("Not a binary FBX file.");
+ 
+            uint version = BitConverter.ToUInt32(data, 23); // e.g. 7400
+            bool wide = version >= 7500;  // uses 64-bit node offsets
+            int headerSize = wide ? 25 : 13;  // per-node header
+ 
+            // Walk top-level nodes looking for Objects
+            int pos = 27;
+            while (pos < data.Length - 13)
+            {
+                var node = ReadNode(data, ref pos, wide);
+                if (node == null) break;
+                if (node.Name == "Objects")
+                {
+                    // Find Geometry children
+                    int childPos = node.ChildrenStart;
+                    while (childPos < node.End - 13)
+                    {
+                        var child = ReadNode(data, ref childPos, wide);
+                        if (child == null) break;
+                        if (child.Name == "Geometry")
+                            ExtractGeometry(data, child, wide, verts, uvs, norms, faces, ref bMin, ref bMax);
+                    }
+                }
+            }
+            return (verts, uvs, norms, faces, bMin, bMax);
+        }
+ 
+        class FbxNode { public string Name; public int ChildrenStart, End; }
+ 
+        static FbxNode ReadNode(byte[] d, ref int pos, bool wide)
+        {
+            if (pos + (wide ? 25 : 13) > d.Length) return null;
+            long endOff  = wide ? (long)BitConverter.ToUInt64(d,pos) : BitConverter.ToUInt32(d,pos);
+            long numProp = wide ? (long)BitConverter.ToUInt64(d,pos+8) : BitConverter.ToUInt32(d,pos+4);
+            long propLen = wide ? (long)BitConverter.ToUInt64(d,pos+16) : BitConverter.ToUInt32(d,pos+8);
+            int  nameLen = d[pos + (wide?24:12)];
+            pos += wide ? 25 : 13;
+            if (endOff == 0) return null;  // null-record sentinel
+ 
+            string name = System.Text.Encoding.ASCII.GetString(d, pos, nameLen);
+            pos += nameLen;
+ 
+            var node = new FbxNode { Name = name, End = (int)endOff };
+ 
+            // Skip over all properties
+            pos += (int)propLen;
+            node.ChildrenStart = pos;
+ 
+            pos = (int)endOff;
+            return node;
+        }
+ 
+        static void ExtractGeometry(byte[] d, FbxNode geo, bool wide,
+            List<Vector3> verts, List<Vector2> uvs, List<Vector3> norms,
+            List<MeshFace> faces, ref Vector3 bMin, ref Vector3 bMax)
+        {
+            // Read child nodes of this Geometry block properly (we need property data)
+            double[] rawVerts = null;
+            int[]    polyIdx  = null;
+            double[] rawNorms = null, rawUVs = null;
+            int[]    normIdx  = null, uvIdx  = null;
+            string   normMapping = "ByPolygonVertex", uvMapping = "ByPolygonVertex";
+            string   normRef     = "Direct",          uvRef     = "IndexToDirect";
+ 
+            int pos = geo.ChildrenStart;
+            while (pos < geo.End - (wide ? 25 : 13))
+            {
+                int savedPos = pos;
+                var child = ReadNodeWithProps(d, ref pos, wide, out var props);
+                if (child == null) break;
+ 
+                switch (child.Name)
+                {
+                    case "Vertices":
+                        rawVerts = GetDoubleArray(d, savedPos, wide);  break;
+                    case "PolygonVertexIndex":
+                        polyIdx  = GetIntArray(d, savedPos, wide);     break;
+                    case "LayerElementNormal":
+                        ReadLayerElement(d, child, wide, "Normals", out rawNorms, out normIdx, out normMapping, out normRef);
+                        break;
+                    case "LayerElementUV":
+                        ReadLayerElement(d, child, wide, "UV", out rawUVs, out uvIdx, out uvMapping, out uvRef);
+                        break;
+                }
+            }
+ 
+            if (rawVerts == null || polyIdx == null) return;
+ 
+            // Build per-polygon-vertex lists
+            int vBase = verts.Count;
+            // Add all source vertices
+            for (int i = 0; i + 2 < rawVerts.Length; i += 3)
+            {
+                var pt = new Vector3((float)rawVerts[i], (float)rawVerts[i+1], (float)rawVerts[i+2]);
+                verts.Add(pt); uvs.Add(Vector2.Zero); norms.Add(Vector3.UnitY);
+                bMin = Vector3.ComponentMin(bMin,pt); bMax = Vector3.ComponentMax(bMax,pt);
+            }
+ 
+            // Parse polygon list ? triangles
+            var poly = new List<int>();
+            int pvIdx = 0;
+            for (int i = 0; i < polyIdx.Length; i++)
+            {
+                int idx = polyIdx[i];
+                bool last = idx < 0;
+                if (last) idx = ~idx;
+ 
+                // Resolve normal and UV for this polygon vertex
+                int normI = ResolveLayerIdx(normMapping, normRef, normIdx, pvIdx, idx, rawNorms?.Length/3 ?? 0);
+                int uvI   = ResolveLayerIdx(uvMapping,   uvRef,   uvIdx,   pvIdx, idx, rawUVs?.Length/2   ?? 0);
+ 
+                // Write UV/Normal into the vertex slot (per polygon-vertex override)
+                // We create a unique vertex for each polygon-vertex to support per-face attributes
+                int newV = vBase + idx;
+                if (rawUVs   != null && uvI >= 0 && uvI*2+1 < rawUVs.Length)
+                    uvs[newV] = new Vector2((float)rawUVs[uvI*2], (float)rawUVs[uvI*2+1]);
+                if (rawNorms != null && normI >= 0 && normI*3+2 < rawNorms.Length)
+                    norms[newV] = new Vector3((float)rawNorms[normI*3], (float)rawNorms[normI*3+1], (float)rawNorms[normI*3+2]);
+ 
+                poly.Add(vBase + idx);
+                pvIdx++;
+ 
+                if (last)
+                {
+                    for (int k = 1; k < poly.Count - 1; k++)
+                        faces.Add(new MeshFace(new[]{poly[0],poly[k],poly[k+1]},
+                                               new[]{poly[0],poly[k],poly[k+1]},
+                                               new[]{poly[0],poly[k],poly[k+1]}));
+                    poly.Clear();
+                }
+            }
+        }
+ 
+        static int ResolveLayerIdx(string mapping, string reference, int[] idxArr, int pvIdx, int vertIdx, int dataCount)
+        {
+            int raw = mapping == "ByPolygonVertex" ? pvIdx : vertIdx;
+            if (raw >= dataCount) raw = dataCount > 0 ? dataCount - 1 : 0;
+            if (reference == "IndexToDirect" && idxArr != null)
+                raw = raw < idxArr.Length ? idxArr[raw] : 0;
+            return raw;
+        }
+ 
+        static void ReadLayerElement(byte[] d, FbxNode el, bool wide, string arrayNodeName,
+            out double[] outArr, out int[] outIdx, out string mapping, out string reference)
+        {
+            outArr = null; outIdx = null; mapping = "ByPolygonVertex"; reference = "Direct";
+            int pos = el.ChildrenStart;
+            while (pos < el.End - (wide ? 25 : 13))
+            {
+                int sp = pos;
+                var child = ReadNodeWithProps(d, ref pos, wide, out _);
+                if (child == null) break;
+                if (child.Name == arrayNodeName)           outArr  = GetDoubleArray(d, sp, wide);
+                else if (child.Name == arrayNodeName+"Index") outIdx = GetIntArray(d, sp, wide);
+                else if (child.Name == "MappingInformationType") mapping   = GetString(d, sp, wide);
+                else if (child.Name == "ReferenceInformationType") reference = GetString(d, sp, wide);
+            }
+        }
+ 
+        // -- Property readers -------------------------------------------------
+        // Each of these seeks to the first property of the named node and reads its value.
+        static double[] GetDoubleArray(byte[] d, int nodeStart, bool wide)
+        {
+            int pos = nodeStart;
+            SkipNodeHeader(d, ref pos, wide);
+            if (pos >= d.Length) return null;
+            char t = (char)d[pos]; pos++;
+            if (t == 'd') return ReadArrayProp<double>(d, ref pos, 8, BitConverter.ToDouble);
+            if (t == 'f') { var fa = ReadArrayProp<float>(d, ref pos, 4, (b,o)=>BitConverter.ToSingle(b,o)); return System.Array.ConvertAll(fa, x=>(double)x); }
+            return null;
+        }
+        static int[] GetIntArray(byte[] d, int nodeStart, bool wide)
+        {
+            int pos = nodeStart;
+            SkipNodeHeader(d, ref pos, wide);
+            if (pos >= d.Length) return null;
+            char t = (char)d[pos]; pos++;
+            if (t == 'i') return ReadArrayProp<int>(d, ref pos, 4, BitConverter.ToInt32);
+            if (t == 'l') { var la = ReadArrayProp<long>(d, ref pos, 8, BitConverter.ToInt64); return System.Array.ConvertAll(la, x=>(int)x); }
+            return null;
+        }
+        static string GetString(byte[] d, int nodeStart, bool wide)
+        {
+            int pos = nodeStart;
+            SkipNodeHeader(d, ref pos, wide);
+            if (pos >= d.Length) return "";
+            char t = (char)d[pos]; pos++;
+            if (t == 'S') { int len = BitConverter.ToInt32(d,pos); pos+=4; return System.Text.Encoding.ASCII.GetString(d,pos,len); }
+            return "";
+        }
+ 
+        static void SkipNodeHeader(byte[] d, ref int pos, bool wide)
+        {
+            long endOff  = wide ? (long)BitConverter.ToUInt64(d,pos) : BitConverter.ToUInt32(d,pos);
+            long numProp = wide ? (long)BitConverter.ToUInt64(d,pos+8) : BitConverter.ToUInt32(d,pos+4);
+            pos += wide ? 25 : 13;
+            int nameLen = d[pos-1]; pos += nameLen;
+            // pos now at first property
+        }
+ 
+        static T[] ReadArrayProp<T>(byte[] d, ref int pos, int elemSize, Func<byte[],int,T> conv)
+        {
+            if (pos + 12 > d.Length) return new T[0];
+            int count    = BitConverter.ToInt32(d, pos); pos += 4;
+            int encoding = BitConverter.ToInt32(d, pos); pos += 4;
+            int compLen  = BitConverter.ToInt32(d, pos); pos += 4;
+            byte[] raw;
+            if (encoding == 1)
+            {
+                // zlib-deflate compressed (skip 2 zlib header bytes)
+                raw = new byte[count * elemSize];
+                try
+                {
+                    using (var ms  = new MemoryStream(d, pos + 2, compLen - 2))
+                    using (var def = new System.IO.Compression.DeflateStream(ms, System.IO.Compression.CompressionMode.Decompress))
+                    {
+                        int read = 0, total = raw.Length;
+                        while (read < total) { int r = def.Read(raw, read, total-read); if(r==0)break; read+=r; }
+                    }
+                }
+                catch { }
+                pos += compLen;
+            }
+            else
+            {
+                int byteCount = count * elemSize;
+                raw = new byte[byteCount];
+                System.Buffer.BlockCopy(d, pos, raw, 0, Math.Min(byteCount, d.Length - pos));
+                pos += byteCount;
+            }
+            var result = new T[count];
+            for (int i = 0; i < count; i++) result[i] = conv(raw, i * elemSize);
+            return result;
+        }
+ 
+        static FbxNode ReadNodeWithProps(byte[] d, ref int pos, bool wide, out object[] props)
+        {
+            props = null;
+            if (pos + (wide ? 25 : 13) > d.Length) return null;
+            long endOff  = wide ? (long)BitConverter.ToUInt64(d,pos) : BitConverter.ToUInt32(d,pos);
+            long numProp = wide ? (long)BitConverter.ToUInt64(d,pos+8) : BitConverter.ToUInt32(d,pos+4);
+            long propLen = wide ? (long)BitConverter.ToUInt64(d,pos+16) : BitConverter.ToUInt32(d,pos+8);
+            int nameLen  = d[pos + (wide?24:12)];
+            pos += wide ? 25 : 13;
+            if (endOff == 0) return null;
+            string name = System.Text.Encoding.ASCII.GetString(d, pos, nameLen);
+            pos += nameLen;
+            var node = new FbxNode { Name = name, End = (int)endOff };
+            pos += (int)propLen;
+            node.ChildrenStart = pos;
+            pos = (int)endOff;
+            return node;
+        }
+    }
+ 
+ 
 // =============================================================================
 //  CSV COLUMN PICKER DIALOG
 //  Shown before loading any .csv file so the user can confirm or override
@@ -2656,7 +3525,7 @@ void main() { FragColor = vec4(color, 1.0); }
             Add(new Label { Text = "Select the 0-based column index for each field:",
                 Location = new Point(14, 118), Size = new Size(400, 18) });
  
-            // ── Spinners ────────────────────────────────────────────────────
+            // -- Spinners ----------------------------------------------------
             int sy = 142;
             var numX = Spin("X  (right)",  defX,  14, sy);
             var numY = Spin("Y  (up)",     defY, 148, sy);
@@ -2665,17 +3534,17 @@ void main() { FragColor = vec4(color, 1.0); }
             var numU = Spin("U  (tex-X)",  defU,  14, sy);
             var numV = Spin("V  (tex-Y)",  defV, 148, sy);
  
-            // ── Header checkbox ─────────────────────────────────────────────
+            // -- Header checkbox ---------------------------------------------
             var chkHdr = new CheckBox { Text = "First row is a header (skip it)",
                 Checked = defHdr, Location = new Point(14, sy + 54), AutoSize = true };
             Add(chkHdr);
  
-            // ── Info tip ────────────────────────────────────────────────────
-            Add(new Label { Text = "Z is mirrored  •  V is flipped automatically.",
+            // -- Info tip ----------------------------------------------------
+            Add(new Label { Text = "Z is mirrored  �  V is flipped automatically.",
                 Location = new Point(14, sy + 80), Size = new Size(400, 18),
                 ForeColor = Color.FromArgb(110, 110, 110) });
  
-            // ── Buttons ─────────────────────────────────────────────────────
+            // -- Buttons -----------------------------------------------------
             int by = ClientSize.Height - 50;
             var okBtn  = Btn("Load",   14,  by, 190);
             var canBtn = Btn("Cancel", 218, by, 196);
