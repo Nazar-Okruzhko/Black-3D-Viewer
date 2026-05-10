@@ -61,7 +61,6 @@ in vec2 TexCoord;
 in mat3 TBN;
  
 uniform vec3 lightPos;
-uniform vec3 lightPos2;
 uniform vec3 viewPos;
  
 uniform sampler2D colorMap;
@@ -79,6 +78,7 @@ uniform int hasMetallicMap;
 uniform int hasOpacityMap;
  
 uniform int  shadingMode;
+uniform int  shadingFlatSlot;   // active slot for mode 4 (flat raw texture)
 uniform vec3 solidColor;
  
 vec3 shade(vec3 lp, vec3 lc, vec3 norm, vec3 vd,
@@ -93,9 +93,9 @@ vec3 shade(vec3 lp, vec3 lc, vec3 norm, vec3 vd,
     vec3  kD  = (1.0 - F) * (1.0 - metal);
     float dist = length(lp - FragPos);
     float att  = 1.0 / (1.0 + 0.001 * dist + 0.00005 * dist * dist);
-    vec3 ambient  = 0.30 * lc * albedo;
-    vec3 diffuse  = kD * d * lc * albedo * 1.4;
-    vec3 specular = F * s * sstr * lc * 0.8;
+    vec3 ambient  = 0.15 * lc * albedo;
+    vec3 diffuse  = kD * d * lc * albedo * 0.7;
+    vec3 specular = F * s * sstr * lc * 0.4;
     return ambient + (diffuse + specular) * att;
 }
  
@@ -110,9 +110,32 @@ void main()
             : vec4(0.75, 0.08, 0.08, 1.0);
         return;
     }
+    // Mode 4 = flat raw texture for the active slot (no lighting, no depth)
+    if (shadingMode == 4) {
+        vec3 raw = solidColor;
+        if      (shadingFlatSlot == 0 && hasColorMap     != 0) raw = texture(colorMap,     TexCoord).rgb;
+        else if (shadingFlatSlot == 1 && hasNormalMap    != 0) raw = texture(normalMap,    TexCoord).rgb;
+        else if (shadingFlatSlot == 2 && hasSpecularMap  != 0) raw = vec3(texture(specularMap,  TexCoord).r);
+        else if (shadingFlatSlot == 3 && hasRoughnessMap != 0) raw = vec3(texture(roughnessMap, TexCoord).r);
+        else if (shadingFlatSlot == 4 && hasMetallicMap  != 0) raw = vec3(texture(metallicMap,  TexCoord).r);
+        else if (shadingFlatSlot == 5 && hasOpacityMap   != 0) raw = vec3(texture(opacityMap,   TexCoord).r);
+        FragColor = vec4(raw, 1.0);
+        return;
+    }
  
-    vec3 albedo = solidColor;
-    if (hasColorMap != 0) albedo = texture(colorMap, TexCoord).rgb;
+    // Mode 0 = Solid shading: clean Lambert diffuse + ambient, no texture/PBR complexity
+    if (shadingMode == 0) {
+        vec3  norm  = normalize(Normal);
+        vec3  ld    = normalize(lightPos - FragPos);
+        float diff  = max(dot(norm, ld), 0.0);
+        // Soft fill from the opposite/below direction for visual depth
+        vec3  fill_dir = normalize(vec3(-ld.x, abs(ld.y), -ld.z));
+        float fill  = max(dot(norm, fill_dir), 0.0) * 0.18;
+        float light = 0.38 + 0.60 * diff + fill;
+        FragColor = vec4(solidColor * clamp(light, 0.0, 1.0), 1.0);
+        return;
+    }
+ 
  
     vec3 norm = normalize(Normal);
     if (hasNormalMap != 0)
@@ -121,13 +144,16 @@ void main()
         norm = normalize(TBN * nt);
     }
  
+    // albedo: color map when available, otherwise the solid grey
+    vec3 albedo = solidColor;
+    if (hasColorMap != 0) albedo = texture(colorMap, TexCoord).rgb;
+ 
     float rough = (hasRoughnessMap != 0) ? texture(roughnessMap, TexCoord).r : 0.5;
     float metal = (hasMetallicMap  != 0) ? texture(metallicMap,  TexCoord).r : 0.0;
     float sstr  = (hasSpecularMap  != 0) ? texture(specularMap,  TexCoord).r : 0.4;
  
     vec3 vd     = normalize(viewPos - FragPos);
-    vec3 result = shade(lightPos,  vec3(1.0, 1.0, 1.0), norm, vd, albedo, rough, metal, sstr)
-                + shade(lightPos2, vec3(0.75, 0.75, 0.75), norm, vd, albedo, rough, metal, sstr);
+    vec3 result = shade(lightPos,  vec3(1.0, 1.0, 1.0), norm, vd, albedo, rough, metal, sstr);
  
     float alpha = (hasOpacityMap != 0) ? texture(opacityMap, TexCoord).r : 1.0;
     FragColor = vec4(result, alpha);
@@ -351,21 +377,45 @@ void main() { FragColor = vec4(color, 1.0); }
         // Returns column mapping or null when the user cancels.
         public static Func<string, (int colX,int colY,int colZ,int colU,int colV,bool header)?> CsvFieldsSelector = null;
  
-        // -- Normal recalculation (smooth) -------------------------------------
+        // -- Normal recalculation (smooth, always outward-facing) --------------
         public void RecalcNormals()
         {
-            var acc = new Vector3[Vertices.Count];
+            var center = GetCenter();
+            var acc    = new Vector3[Vertices.Count];
             foreach (var face in Faces)
             {
-                if (face.VI[0] >= Vertices.Count || face.VI[1] >= Vertices.Count || face.VI[2] >= Vertices.Count) continue;
-                var e1 = Vertices[face.VI[1]] - Vertices[face.VI[0]];
-                var e2 = Vertices[face.VI[2]] - Vertices[face.VI[0]];
-                var fn = Vector3.Cross(e1, e2); fn.Normalize();
-                acc[face.VI[0]] += fn; acc[face.VI[1]] += fn; acc[face.VI[2]] += fn;
+                if (face.VI[0] >= Vertices.Count ||
+                    face.VI[1] >= Vertices.Count ||
+                    face.VI[2] >= Vertices.Count) continue;
+
+                var v0 = Vertices[face.VI[0]];
+                var v1 = Vertices[face.VI[1]];
+                var v2 = Vertices[face.VI[2]];
+                var e1 = v1 - v0;
+                var e2 = v2 - v0;
+                var fn = Vector3.Cross(e1, e2);
+                if (fn.LengthSquared < 1e-14f) continue;
+                fn.Normalize();
+
+                // Ensure the normal points away from the model centre.
+                // This corrects inverted winding (e.g. from axis-swap loaders).
+                var faceCenter = (v0 + v1 + v2) * (1f / 3f);
+                if (Vector3.Dot(fn, faceCenter - center) < 0f) fn = -fn;
+
+                acc[face.VI[0]] += fn;
+                acc[face.VI[1]] += fn;
+                acc[face.VI[2]] += fn;
             }
             Normals.Clear();
-            for (int i = 0; i < acc.Length; i++) { acc[i].Normalize(); Normals.Add(acc[i]); }
-            foreach (var face in Faces) for (int j = 0; j < 3; j++) face.NI[j] = face.VI[j];
+            for (int i = 0; i < acc.Length; i++)
+            {
+                if (acc[i].LengthSquared < 1e-14f) acc[i] = Vector3.UnitY;
+                else acc[i].Normalize();
+                Normals.Add(acc[i]);
+            }
+            foreach (var face in Faces)
+                for (int j = 0; j < 3; j++)
+                    face.NI[j] = face.VI[j];
         }
  
         // -- Edge counting -----------------------------------------------------
@@ -382,7 +432,7 @@ void main() { FragColor = vec4(color, 1.0); }
         }
  
         // -- GPU buffer upload -------------------------------------------------
-        private void BuildBuffers()
+        public void BuildBuffers()
         {
             if (VAO != 0) { GL.DeleteVertexArray(VAO); GL.DeleteBuffer(VBO); GL.DeleteBuffer(EBO); }
  
@@ -686,13 +736,14 @@ void main() { FragColor = vec4(color, 1.0); }
         }
  
         // -- GPU Render --------------------------------------------------------
-        public void Render(Shader sh, int mode)
+        public void Render(Shader sh, int mode, int flatSlot = -1, Vector3? solidColor = null)
         {
             sh.Use();
             sh.SetInt("shadingMode", mode);
-            sh.SetVec3("solidColor", new Vector3(0.86f, 0.86f, 0.86f));
+            sh.SetInt("shadingFlatSlot", flatSlot);
+            sh.SetVec3("solidColor", solidColor ?? new Vector3(0.86f, 0.86f, 0.86f));
  
-            bool doTex = (mode == 2);
+            bool doTex = (mode == 2 || mode == 4);
             BindTex(sh, 0, ColorMapId,     doTex);
             BindTex(sh, 1, NormalMapId,    doTex);
             BindTex(sh, 2, SpecularMapId,  doTex);
@@ -722,6 +773,21 @@ void main() { FragColor = vec4(color, 1.0); }
 // =============================================================================
 //  SECTION 5 - FORM SETUP & UI CONTROLS
 // =============================================================================
+ 
+    // Eliminates flicker by compositing into an offscreen buffer before display.
+    // Also suppresses OnPaintBackground so our checker/texture covers every pixel.
+    sealed class DoubleBufferedPanel : Panel
+    {
+        public DoubleBufferedPanel()
+        {
+            SetStyle(ControlStyles.UserPaint |
+                     ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer, true);
+            UpdateStyles();
+        }
+        // Don't let WinForms erase the background — our OnPaint covers 100% of pixels.
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+    }
  
     public class Viewer3DForm : Form
     {
@@ -784,9 +850,11 @@ void main() { FragColor = vec4(color, 1.0); }
         private Bitmap   _checkerBmp;               // checker background (cached per panel size)
         private Bitmap[] _slotBmps = new Bitmap[6]; // per-slot CPU bitmaps for preview panel
         private bool     uvDirty   = true;
-        // -- UV overlay transition (0=hidden, 1=fully visible) --
-        private float _uvT      = 0f;
+        // -- UV-box animated overlays (0=hidden, 1=visible) --
+        private float _uvT      = 0f;   // UV wireframe overlay alpha
         private float _uvTarget = 0f;
+        private float _texAlpha = 1f;   // texture layer alpha (fades on slot change)
+        private float _texTarget= 1f;
         // -- Texture hot-reload: poll LastWriteTime every 500 ms (works with all editors) --
         private readonly string[]   _hotPaths     = new string[6];
         private readonly DateTime[] _hotLastWrite = new DateTime[6];
@@ -832,7 +900,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void BuildUI()
         {
-            Text        = "HotDog ? 3D Viewer";
+            Text        = "Black 3D Viewer";
             ClientSize  = new Size(1200, 800);
             MinimumSize = new Size(800, 600);
             AllowDrop   = true;
@@ -859,7 +927,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 Text = "No texture found",
                 Location = new Point(10, 54), Size = new Size(200, 22),
                 Font = new Font("Segoe UI", 9, FontStyle.Bold),
-                ForeColor = Color.FromArgb(210, 55, 55), BackColor = Color.Transparent, Visible = false
+                ForeColor = Color.White, BackColor = Color.Transparent, Visible = false
             };
             glControl.Controls.Add(noTexLabel);
  
@@ -873,32 +941,28 @@ void main() { FragColor = vec4(color, 1.0); }
  
             envLightTab.Controls.Add(new Label { Text = "Light Direction", Font = new Font("Segoe UI", 9, FontStyle.Bold), Location = new Point(70, 10), AutoSize = true, BackColor = BG });
  
-            lightPanel = new Panel
+            lightPanel = new DoubleBufferedPanel
             {
                 Location = new Point(55, 35), Size = new Size(180, 180),
-                BackColor = Color.White, BorderStyle = BorderStyle.FixedSingle
+                BackColor = BG, BorderStyle = BorderStyle.None
             };
             lightPanel.Paint     += OnLightPaint;
             lightPanel.MouseDown += (s, e) => { dragLight = true;  UpdateLight(e.Location); };
             lightPanel.MouseUp   += (s, e) =>   dragLight = false;
             lightPanel.MouseMove += (s, e) => { if (dragLight) UpdateLight(e.Location); };
             envLightTab.Controls.Add(lightPanel);
- 
-            envLightTab.Controls.Add(new Label { Text = "Drag the dot to orbit the\nkey light around the model.",
-                Location = new Point(55, 225), Size = new Size(180, 36), Font = new Font("Segoe UI", 8),
-                ForeColor = Color.FromArgb(100, 100, 100), BackColor = BG });
- 
+
             // --- Stats & Shading tab ---
             statsShadingTab = new TabPage("Stats & Shading") { BackColor = BG };
             tabControl.TabPages.Add(statsShadingTab);
  
             int y = 10;
-            loadedLabel = new Label { Text = "Default Cube", Font = new Font("Segoe UI", 10, FontStyle.Bold),
+            loadedLabel = new Label { Text = "Black 3D Viewer", Font = new Font("Segoe UI", 10, FontStyle.Bold),
                 Location = new Point(10, y), Size = new Size(270, 26), BackColor = BG };
             statsShadingTab.Controls.Add(loadedLabel); y += 34;
  
             // UV preview panel (toggled by button; always pre-rendered)
-            previewPanel = new Panel
+            previewPanel = new DoubleBufferedPanel
             {
                 Location = new Point(10, y), Size = new Size(270, 270),
                 BackColor = Color.FromArgb(30,  30,  30),  BorderStyle = BorderStyle.FixedSingle
@@ -915,7 +979,7 @@ void main() { FragColor = vec4(color, 1.0); }
             wireBtn.Click  += (s, e) => { shadeMode = 1; RefreshShade(); };
  
             texBtn = SBtn(statsShadingTab, "Texture View", ref y);
-            texBtn.Click   += (s, e) => { shadeMode = 2; RefreshShade(); };
+            texBtn.Click   += (s, e) => { shadeMode = 2; RefreshTexBtns(); RefreshShade(); };
             y += 8;
  
             // Texture maps group
@@ -948,15 +1012,25 @@ void main() { FragColor = vec4(color, 1.0); }
                 glControl.Invalidate();
             };
  
-            uvBtn = SBtn(statsShadingTab, "Show UV Preview", ref y);
+            uvBtn = SBtn(statsShadingTab, "Show UV Map", ref y);
             uvBtn.Click += (s, e) =>
             {
-                showUV    = !showUV;
-                _uvTarget = showUV ? 1f : 0f;
+                showUV = !showUV;
                 uvBtn.BackColor = showUV ? PRESS : IDLE;
-                uvDirty   = true;
-                _themeTimer.Start();   // reuses animation timer for UV fade
-                previewPanel.Invalidate();
+                if (showUV)
+                {
+                    // UV turns ON  ? texture fades OUT, UV (dark bg + lines) fades IN
+                    _uvTarget  = 1f;
+                    _texTarget = 0f;
+                    uvDirty    = true;
+                }
+                else
+                {
+                    // UV turns OFF ? UV fades OUT, texture fades back IN
+                    _uvTarget  = 0f;
+                    _texTarget = model != null && !string.IsNullOrEmpty(model.TexPaths[texSlot]) ? 1f : 0f;
+                }
+                _themeTimer.Start();
             };
             y += 12;
  
@@ -1033,13 +1107,18 @@ void main() { FragColor = vec4(color, 1.0); }
                 float diff = _themeTarget - _themeT;
                 if (Math.Abs(diff) <= step) _themeT = _themeTarget;
                 else                        _themeT += diff > 0 ? step : -step;
-                // UV overlay transition
+                // UV wireframe overlay transition
                 float uvDiff = _uvTarget - _uvT;
                 if (Math.Abs(uvDiff) <= step) _uvT = _uvTarget;
                 else                          _uvT += uvDiff > 0 ? step : -step;
-                // Stop when both animations are complete
-                if (Math.Abs(_themeTarget - _themeT) < 0.001f &&
-                    Math.Abs(_uvTarget    - _uvT)    < 0.001f)
+                // Texture layer alpha transition (slot switch fade)
+                float texDiff = _texTarget - _texAlpha;
+                if (Math.Abs(texDiff) <= step) _texAlpha = _texTarget;
+                else                           _texAlpha += texDiff > 0 ? step : -step;
+                // Stop when all three animations are idle
+                if (Math.Abs(_themeTarget - _themeT)   < 0.001f &&
+                    Math.Abs(_uvTarget    - _uvT)       < 0.001f &&
+                    Math.Abs(_texTarget   - _texAlpha)  < 0.001f)
                     _themeTimer.Stop();
                 previewPanel.Invalidate();
                 glControl.Invalidate();
@@ -1112,7 +1191,6 @@ void main() { FragColor = vec4(color, 1.0); }
             // Lights at fixed distance relative to model size (zoom-independent)
             float ld  = Math.Max(cachedSize * 3f, 10f);
             Vector3 lp1 = new Vector3(ld*(float)Math.Cos(lightAngle), ld*0.6f, ld*(float)Math.Sin(lightAngle));
-            Vector3 lp2 = new Vector3(ld*(float)Math.Cos(lightAngle+(float)Math.PI), ld*0.4f, ld*(float)Math.Sin(lightAngle+(float)Math.PI));
  
             // Model stays at its original coordinate space (no centering translation)
             Matrix4 modelMat = Matrix4.Identity;
@@ -1124,24 +1202,34 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetMat4("projection", ref proj);
                 wireShader.SetMat4("view",       ref view);
                 wireShader.SetMat4("model",      ref modelMat);
- 
-                // Solid fill pass (coloured)
-                wireShader.SetVec3("color", new Vector3(0.86f, 0.86f, 0.86f));
+
+                // --- Solid fill pass ---
+                // Push the filled surface slightly back in depth so the line pass
+                // always wins the depth test and every edge stays fully visible.
+                GL.Enable(EnableCap.PolygonOffsetFill);
+                GL.PolygonOffset(1.5f, 1.5f);
+                wireShader.SetVec3("color", darkTheme
+                    ? new Vector3(0.22f, 0.22f, 0.22f)
+                    : new Vector3(0.82f, 0.82f, 0.82f));
                 DrawMesh();
- 
-                // Line pass (black edges) � slightly thicker to survive MSAA
+                GL.Disable(EnableCap.PolygonOffsetFill);
+                GL.PolygonOffset(0f, 0f);
+
+                // --- Line pass (edges) ---
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
-                GL.LineWidth(1.6f);
-                wireShader.SetVec3("color", darkTheme ? new Vector3(0.08f, 0.08f, 0.08f) : new Vector3(0.05f, 0.05f, 0.05f));
+                GL.LineWidth(2.2f);
+                wireShader.SetVec3("color", darkTheme
+                    ? new Vector3(0.85f, 0.85f, 0.85f)
+                    : new Vector3(0.04f, 0.04f, 0.04f));
                 DrawMesh();
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
+                GL.LineWidth(1f);
             }
             else
             {
                 // -- Solid / Texture mode --
                 mainShader.Use();
                 mainShader.SetVec3("lightPos",  lp1);
-                mainShader.SetVec3("lightPos2", lp2);
                 mainShader.SetVec3("viewPos",   camPos);
                 mainShader.SetMat4("projection", ref proj);
                 mainShader.SetMat4("view",       ref view);
@@ -1158,7 +1246,21 @@ void main() { FragColor = vec4(color, 1.0); }
                     GL.DrawElements(PrimitiveType.Triangles, 36, DrawElementsType.UnsignedInt, 0);
                     GL.BindVertexArray(0);
                 }
-                else model?.Render(mainShader, showNormals ? 3 : shadeMode);
+                else
+                {
+                    int renderMode = showNormals ? 3 : shadeMode;
+                    // For flat-slot mode (4) with no texture, use a colour that clearly
+                    // contrasts the background so the model is always visible:
+                    //   Light mode bg ≈ 0.867  →  #2E2E2E (very dark)
+                    //   Dark  mode bg ≈ 0.18   →  #DDDDDD (very light)
+                    // All other modes use the standard grey so Solid shading is unchanged.
+                    Vector3 sc = (renderMode == 4)
+                        ? (_themeT < 0.5f
+                            ? new Vector3(0.180f, 0.180f, 0.180f)   // #2E2E2E
+                            : new Vector3(0.867f, 0.867f, 0.867f))  // #DDDDDD
+                        : new Vector3(0.86f, 0.86f, 0.86f);         // standard grey
+                    model?.Render(mainShader, renderMode, texSlot, sc);
+                }
             }
  
             // -- Grid & Axes ? always at world origin (0,0,0) --
@@ -1169,57 +1271,78 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetMat4("view",       ref view);
                 wireShader.SetMat4("model",      ref modelMat);
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
- 
-                var lv = new List<float>();
- 
+
+                // ---- Grid (thin GL_LINES, unchanged) ----
                 if (showGrid)
                 {
+                    var lv = new List<float>();
                     float gs   = Math.Max(cachedSize, 2f) * 2f;
                     float step = gs / 10f;
-                    float yFloor = !showCube && model != null ? model.BoundsMin.Y : 0f;
+                    float yFloor = 0f;
                     for (int gi = -10; gi <= 10; gi++)
                     {
-                        lv.AddRange(new[] { gi*step, yFloor, -gs,   gi*step, yFloor,  gs });  // Z lines
-                        lv.AddRange(new[] { -gs, yFloor, gi*step,    gs, yFloor, gi*step });  // X lines
+                        lv.AddRange(new[] { gi*step, yFloor, -gs,   gi*step, yFloor,  gs });
+                        lv.AddRange(new[] { -gs, yFloor, gi*step,    gs, yFloor, gi*step });
                     }
-                }
- 
-                if (showAxes)
-                {
-                    // Short axes at world origin
-                    float al = Math.Max(cachedSize * 0.12f, 0.5f);
-                    lv.AddRange(new float[] { 0,0,0,  al,0,0  });  // X ? red
-                    lv.AddRange(new float[] { 0,0,0,  0,al,0  });  // Y ? green
-                    lv.AddRange(new float[] { 0,0,0,  0,0,al  });  // Z ? blue
-                }
- 
-                float[] lva  = lv.ToArray();
-                int tVAO = GL.GenVertexArray(), tVBO = GL.GenBuffer();
-                GL.BindVertexArray(tVAO);
-                GL.BindBuffer(BufferTarget.ArrayBuffer, tVBO);
-                GL.BufferData(BufferTarget.ArrayBuffer, lva.Length * sizeof(float), lva, BufferUsageHint.StreamDraw);
-                GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3*sizeof(float), 0);
-                GL.EnableVertexAttribArray(0);
- 
-                if (showGrid)
-                {
+                    float[] lva = lv.ToArray();
+                    int gVAO = GL.GenVertexArray(), gVBO = GL.GenBuffer();
+                    GL.BindVertexArray(gVAO);
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, gVBO);
+                    GL.BufferData(BufferTarget.ArrayBuffer, lva.Length * sizeof(float), lva, BufferUsageHint.StreamDraw);
+                    GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3*sizeof(float), 0);
+                    GL.EnableVertexAttribArray(0);
                     GL.LineWidth(1.8f);
                     var gc = darkTheme ? new Vector3(0.42f, 0.42f, 0.42f) : new Vector3(0.15f, 0.15f, 0.15f);
                     wireShader.SetVec3("color", gc);
-                    GL.DrawArrays(PrimitiveType.Lines, 0, 21 * 4); // 21 rows ? 2 lines ? 2 verts
+                    GL.DrawArrays(PrimitiveType.Lines, 0, 21 * 4);
+                    GL.BindVertexArray(0);
+                    GL.DeleteVertexArray(gVAO); GL.DeleteBuffer(gVBO);
                 }
+
+                // ---- Axes (cross-section prism geometry, GL_TRIANGLES) ----
+                // Each axis = 2 flat quads perpendicular to each other forming a "+" cross-section.
+                // This is real 3D geometry so thickness is guaranteed on every driver.
                 if (showAxes)
                 {
-                    GL.LineWidth(2.5f);
-                    int axOff = showGrid ? 21 * 4 : 0;
-                    wireShader.SetVec3("color", new Vector3(0.9f, 0.15f, 0.15f)); GL.DrawArrays(PrimitiveType.Lines, axOff,     2);
-                    wireShader.SetVec3("color", new Vector3(0.15f, 0.85f, 0.15f));GL.DrawArrays(PrimitiveType.Lines, axOff + 2, 2);
-                    wireShader.SetVec3("color", new Vector3(0.15f, 0.4f, 0.95f)); GL.DrawArrays(PrimitiveType.Lines, axOff + 4, 2);
-                    GL.LineWidth(1f);
+                    float al = Math.Max(cachedSize * 0.12f, 0.5f);
+                    float t  = Math.Max(al * 0.02f, 0.004f); // half-thickness — slim but visible
+
+                    var av = new List<float>();
+                    // Adds a flat quad (p0,p1,p2,p3 in order) as 2 triangles
+                    Action<float,float,float, float,float,float,
+                           float,float,float, float,float,float> quad =
+                        (x0,y0,z0, x1,y1,z1, x2,y2,z2, x3,y3,z3) =>
+                    {
+                        av.AddRange(new[]{ x0,y0,z0, x1,y1,z1, x2,y2,z2 });
+                        av.AddRange(new[]{ x0,y0,z0, x2,y2,z2, x3,y3,z3 });
+                    };
+
+                    // X axis (0→al along X): quad in XY plane + quad in XZ plane
+                    quad(0,-t,0,  0,t,0,  al,t,0,  al,-t,0);
+                    quad(0,0,-t,  0,0,t,  al,0,t,  al,0,-t);
+                    // Y axis (0→al along Y): quad in YX plane + quad in YZ plane
+                    quad(-t,0,0,  t,0,0,  t,al,0,  -t,al,0);
+                    quad(0,0,-t,  0,0,t,  0,al,t,  0,al,-t);
+                    // Z axis (0→al along Z): quad in ZX plane + quad in ZY plane
+                    quad(-t,0,0,  t,0,0,  t,0,al,  -t,0,al);
+                    quad(0,-t,0,  0,t,0,  0,t,al,  0,-t,al);
+
+                    float[] ava = av.ToArray();
+                    int aVAO = GL.GenVertexArray(), aVBO = GL.GenBuffer();
+                    GL.BindVertexArray(aVAO);
+                    GL.BindBuffer(BufferTarget.ArrayBuffer, aVBO);
+                    GL.BufferData(BufferTarget.ArrayBuffer, ava.Length * sizeof(float), ava, BufferUsageHint.StreamDraw);
+                    GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3*sizeof(float), 0);
+                    GL.EnableVertexAttribArray(0);
+
+                    GL.Disable(EnableCap.CullFace); // render both faces of each quad
+                    wireShader.SetVec3("color", new Vector3(0.9f,  0.15f, 0.15f)); GL.DrawArrays(PrimitiveType.Triangles, 0,  12); // X red
+                    wireShader.SetVec3("color", new Vector3(0.15f, 0.85f, 0.15f)); GL.DrawArrays(PrimitiveType.Triangles, 12, 12); // Y green
+                    wireShader.SetVec3("color", new Vector3(0.15f, 0.4f,  0.95f)); GL.DrawArrays(PrimitiveType.Triangles, 24, 12); // Z blue
+
+                    GL.BindVertexArray(0);
+                    GL.DeleteVertexArray(aVAO); GL.DeleteBuffer(aVBO);
                 }
- 
-                GL.BindVertexArray(0);
-                GL.DeleteVertexArray(tVAO); GL.DeleteBuffer(tVBO);
             }
  
             glControl.SwapBuffers();
@@ -1249,86 +1372,82 @@ void main() { FragColor = vec4(color, 1.0); }
         {
             var g  = e.Graphics;
             int pw = previewPanel.Width, ph = previewPanel.Height;
- 
-            // 1. Always draw checker background (shows through transparent areas of the texture)
-            var cb = GetCheckerBmp(pw, ph);
-            if (cb != null) g.DrawImage(cb, 0, 0);
- 
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            // ── Always draw the UV-space background (dark + 4-quadrant grid) ──
+            g.Clear(Color.FromArgb(30, 30, 30));
+            float uvSize  = Math.Min(pw, ph);
+            float originX = (pw - uvSize) * 0.5f;
+            float originY = (ph - uvSize) * 0.5f;
+
+            // 4-section dividers (halves, not quarters)
+            using (var gp = new Pen(Color.FromArgb(72, 72, 72), 1f))
+            {
+                float midX = originX + uvSize * 1f;
+                float midY = originY + uvSize * 1f;
+                g.DrawLine(gp, midX, originY, midX, originY + uvSize);   // vertical centre
+                g.DrawLine(gp, originX, midY, originX + uvSize, midY);   // horizontal centre
+            }
+            // UV-space boundary
+            using (var bp = new Pen(Color.FromArgb(100, 100, 100), 1f))
+                g.DrawRectangle(bp, originX, originY, uvSize - 1f, uvSize - 1f);
+
             if (model == null)
             {
                 using (var f = new Font("Segoe UI", 9))
-                    g.DrawString("No model loaded", f, Brushes.DimGray, 10, 10);
+                    g.DrawString("No model loaded", f, Brushes.Gray, originX + 8, originY + 8);
                 return;
             }
- 
-            // 2. Draw the texture of the active slot (if loaded), stretched to fill panel
+
+            // ── Layer 1: texture for selected slot (covers the grid when loaded) ──
             Bitmap slotBmp = GetOrLoadSlotBitmap(texSlot);
             if (slotBmp != null)
             {
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
                 g.DrawImage(slotBmp, 0, 0, pw, ph);
             }
- 
-            // 3. Draw UV wireframe overlay with animated fade (fades in/out via _uvT)
-            if (_uvT > 0.001f && model.TexCoords.Count > 0)
+            else if (_uvT <= 0.005f)
+            {
+                using (var f = new Font("Segoe UI", 9))
+                    g.DrawString("No texture loaded", f, Brushes.Gray, originX + 8, originY + 8);
+            }
+
+            // ── Layer 2: UV wireframe edges (only when Show UV Map is active) ──
+            if (_uvT > 0.005f && model.TexCoords.Count > 0)
             {
                 if (uvDirty || uvCache == null) { RebuildUVCache(); uvDirty = false; }
                 if (uvCache != null)
                 {
                     using (var ia = new System.Drawing.Imaging.ImageAttributes())
                     {
-                        var cm = new System.Drawing.Imaging.ColorMatrix();
-                        cm.Matrix33 = _uvT;   // controls alpha of the overlay
+                        var cm = new System.Drawing.Imaging.ColorMatrix { Matrix33 = _uvT };
                         ia.SetColorMatrix(cm);
-                        g.DrawImage(uvCache,
-                            new Rectangle(0, 0, pw, ph),
-                            0, 0, uvCache.Width, uvCache.Height,
-                            GraphicsUnit.Pixel, ia);
+                        g.DrawImage(uvCache, new Rectangle(0, 0, pw, ph),
+                            0, 0, uvCache.Width, uvCache.Height, GraphicsUnit.Pixel, ia);
                     }
                 }
             }
- 
-            // 4. Info text when nothing at all is visible
-            if (slotBmp == null && _uvT <= 0.001f)
-            {
-                using (var f = new Font("Segoe UI", 9))
-                    g.DrawString("No texture loaded", f, Brushes.DimGray, 10, 10);
-            }
         }
- 
         private void RebuildUVCache()
         {
             uvCache?.Dispose(); uvCache = null;
             int pw = previewPanel.Width, ph = previewPanel.Height;
             if (pw <= 2 || ph <= 2 || model == null) return;
- 
+
+            // Transparent background — only the orange UV edge lines are stored here.
+            // The dark background + 4-box grid are drawn directly in OnUVPaint every frame.
             var bmp = new Bitmap(pw, ph, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                // Transparent so texture shows through when both are active
                 g.Clear(Color.Transparent);
- 
-                const float pad = 10f;
-                float scale = Math.Min(pw - pad * 2, ph - pad * 2);
- 
-                // UV box always uses the dark-mode palette regardless of theme
-                var gridColor = Color.FromArgb(70, 100, 100, 100);
-                using (var gp = new Pen(gridColor, 0.5f))
-                    for (int i = 0; i <= 4; i++)
-                    {
-                        float p = pad + (i / 4f) * scale;
-                        g.DrawLine(gp, p, pad, p, pad + scale);
-                        g.DrawLine(gp, pad, p, pad + scale, p);
-                    }
- 
-                // UV-space boundary
-                var borderColor = Color.FromArgb(95, 95, 95);
-                g.DrawRectangle(new Pen(borderColor, 1f), pad, pad, scale, scale);
- 
-                // UV edges � always classic orange on dark
-                var lineColor = Color.FromArgb(255, 165, 0);
-                using (var pen = new Pen(lineColor, 1f))
+
+                float uvSize  = Math.Min(pw, ph);
+                float originX = (pw - uvSize) * 0.5f;
+                float originY = (ph - uvSize) * 0.5f;
+
+                // UV edges — classic orange
+                using (var pen = new Pen(Color.FromArgb(255, 165, 0), 1f))
                 {
                     var drawn = new HashSet<long>();
                     foreach (var face in model.Faces)
@@ -1342,15 +1461,15 @@ void main() { FragColor = vec4(color, 1.0); }
                             var uv1 = model.TexCoords[a];
                             var uv2 = model.TexCoords[b];
                             g.DrawLine(pen,
-                                pad + uv1.X * scale, pad + (1f - uv1.Y) * scale,
-                                pad + uv2.X * scale, pad + (1f - uv2.Y) * scale);
+                                originX + uv1.X * uvSize,
+                                originY + (1f - uv1.Y) * uvSize,
+                                originX + uv2.X * uvSize,
+                                originY + (1f - uv2.Y) * uvSize);
                         }
                 }
             }
             uvCache = bmp;
         }
- 
-        // -- Checker-board background bitmap (cached; recreated when panel resizes) ----------
         private Bitmap GetCheckerBmp(int w, int h)
         {
             if (_checkerBmp != null && _checkerBmp.Width == w && _checkerBmp.Height == h)
@@ -1412,7 +1531,7 @@ void main() { FragColor = vec4(color, 1.0); }
             if (keyData == Keys.Return || keyData == Keys.Enter)
             {
                 if (model != null) ExportOBJ();
-                return true; // consumed � do NOT forward to focused button
+                return true; // consumed ? do NOT forward to focused button
             }
             return base.ProcessCmdKey(ref msg, keyData);
         }
@@ -1422,12 +1541,6 @@ void main() { FragColor = vec4(color, 1.0); }
             if      (e.KeyCode == Keys.R) { ResetCam();    e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.F) { FocusModel();  e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.M) { ToggleTheme(); e.Handled = e.SuppressKeyPress = true; }
-            else if (e.KeyCode == Keys.N && model != null)
-            {
-                model.RecalcNormals();
-                glControl.Invalidate();
-                e.Handled = e.SuppressKeyPress = true;
-            }
         }
  
         private void FocusModel()
@@ -1644,16 +1757,20 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void OnLightPaint(object sender, PaintEventArgs e)
         {
-            var g = e.Graphics;
+            var g  = e.Graphics;
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            // Match the surrounding tab background so the panel has no visible box
+            g.Clear(BG);
             int cx = lightPanel.Width / 2, cy = lightPanel.Height / 2, r = 70;
-            g.FillEllipse(new SolidBrush(Color.FromArgb(245, 245, 245)), cx-r, cy-r, r*2, r*2);
-            g.DrawEllipse(Pens.LightGray, cx-r, cy-r, r*2, r*2);
-            int lx = (int)(cx + Math.Cos(lightAngle) * (r - 10));
-            int ly = (int)(cy - Math.Sin(lightAngle) * (r - 10));
-            g.DrawLine(new Pen(Color.FromArgb(0, 120, 215), 2), cx, cy, lx, ly);
-            g.FillEllipse(Brushes.Gold, lx - 9, ly - 9, 18, 18);
-            g.DrawEllipse(Pens.DarkGoldenrod, lx - 9, ly - 9, 18, 18);
+            // Circle outline only (no fill – much faster)
+            using (var pen = new Pen(Color.FromArgb(190, 190, 190), 1.5f))
+                g.DrawEllipse(pen, cx - r, cy - r, r * 2, r * 2);
+            // Gold ball at current light angle
+            int lx = (int)(cx + Math.Cos(lightAngle) * (r - 12));
+            int ly = (int)(cy - Math.Sin(lightAngle) * (r - 12));
+            g.FillEllipse(Brushes.Gold, lx - 10, ly - 10, 20, 20);
+            using (var pen = new Pen(Color.DarkGoldenrod, 1.5f))
+                g.DrawEllipse(pen, lx - 10, ly - 10, 20, 20);
         }
  
         private void UpdateLight(Point p)
@@ -1661,7 +1778,8 @@ void main() { FragColor = vec4(color, 1.0); }
             int cx = lightPanel.Width / 2, cy = lightPanel.Height / 2;
             lightAngle = (float)Math.Atan2(cy - p.Y, p.X - cx);
             lightPanel.Invalidate();
-            glControl.Invalidate();
+            lightPanel.Update();     // flush immediately so ball never lags
+            glControl.Invalidate();  // GL update follows asynchronously
         }
  
 // =============================================================================
@@ -1684,7 +1802,7 @@ void main() { FragColor = vec4(color, 1.0); }
                     "All Supported|*.obj;*.csv;*.stl;*.rip;*.nr;*.glb;*.dae;*.fbx;*.ply;*.smd;*.mdl;*.3ds|" +
                     "Wavefront OBJ (*.obj)|*.obj|" +
                     "Stanford PLY (*.ply)|*.ply|" +
-                    "FBX � ASCII & Binary (*.fbx)|*.fbx|" +
+                    "FBX ? ASCII & Binary (*.fbx)|*.fbx|" +
                     "Collada (*.dae)|*.dae|" +
                     "glTF Binary (*.glb)|*.glb|" +
                     "STL (*.stl)|*.stl|" +
@@ -1709,7 +1827,7 @@ void main() { FragColor = vec4(color, 1.0); }
             if (model.Faces.Count == 0) { model = null; return; }
  
             showCube     = false;
-            shadeMode    = 2;
+            shadeMode    = 0;   // start in Solid Shading by default
             texSlot      = 0;
             cachedCenter = model.GetCenter();
             cachedSize   = model.GetSize();
@@ -1721,7 +1839,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
             _loadedModelName = Path.GetFileNameWithoutExtension(path);
             loadedLabel.Text = Path.GetFileName(path);
-            Text = "HotDog � 3D Viewer  �  " + Path.GetFileName(path);
+            Text = "Black 3D Viewer  —  " + Path.GetFileName(path);
             RefreshShade();
             RefreshTexBtns();
             RefreshTexBtnEnabled();
@@ -1744,11 +1862,12 @@ void main() { FragColor = vec4(color, 1.0); }
             if      (MODEL_EXT.Contains(ext))               LoadFile(f);
             else if (TEX_EXT.Contains(ext) && model != null)
             {
-                model.LoadTexture(f, texSlot);
-                TrackTexture(texSlot, f);
-                _slotBmps[texSlot]?.Dispose(); _slotBmps[texSlot] = null;
-                RefreshTexBtnEnabled();
-                UpdateNoTex();
+                // Always load a dropped texture into the Color slot and show it immediately
+                glControl.MakeCurrent();
+                model.LoadTexture(f, 0);
+                TrackTexture(0, f);
+                _slotBmps[0]?.Dispose(); _slotBmps[0] = null;
+                SetSlot(0);   // switches to flat Color-slot view instantly
                 previewPanel.Invalidate();
                 glControl.Invalidate();
             }
@@ -1758,15 +1877,35 @@ void main() { FragColor = vec4(color, 1.0); }
 //  SECTION 11 - UI STATE HELPERS
 // =============================================================================
  
-        private void SetSlot(int s) { texSlot = s; RefreshTexBtns(); UpdateNoTex(); previewPanel.Invalidate(); glControl.Invalidate(); }
+        private void SetSlot(int s)
+        {
+            texSlot = s;
+            // Switch to flat raw-texture mode so the 3D view shows only this map, unlit
+            shadeMode = 4;
+            RefreshTexBtns();
+            RefreshShade();      // sync shading-button highlights (texBtn deselected, etc.)
+            UpdateNoTex();
+            uvDirty = true;
+            // Instant — no fade animation
+            _texAlpha  = (model != null && !string.IsNullOrEmpty(model.TexPaths[s])) ? 1f : 0f;
+            _texTarget = _texAlpha;
+            previewPanel.Invalidate();
+            glControl.Invalidate();
+        }
  
         private void RefreshShade()
         {
-            solidBtn.BackColor = shadeMode == 0 ? PRESS : IDLE;
-            wireBtn.BackColor  = shadeMode == 1 ? PRESS : IDLE;
-            texBtn.BackColor   = shadeMode == 2 ? PRESS : IDLE;
+            solidBtn.BackColor   = shadeMode == 0 ? PRESS : IDLE;
+            wireBtn.BackColor    = shadeMode == 1 ? PRESS : IDLE;
+            // Texture View button is highlighted for both PBR (2) and flat-slot (4) modes
+            texBtn.BackColor     = (shadeMode == 2 || shadeMode == 4) ? PRESS : IDLE;
+            // Clicking any main shading button cancels the normals overlay
+            if (shadeMode != 3) { showNormals = false; showTexBtn.BackColor = IDLE; }
+            // If not in flat-slot mode, clear the slot button highlights
+            if (shadeMode != 4) RefreshTexBtns();
             RefreshTexBtnEnabled();
             UpdateNoTex();
+            previewPanel.Invalidate();
             glControl.Invalidate();
         }
  
@@ -1782,21 +1921,15 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void RefreshTexBtnEnabled()
         {
-            bool en = shadeMode == 2 && model != null;
+            // Buttons are always enabled — never gray them out
             colBtn.Enabled = nrmBtn.Enabled = specBtn.Enabled =
-            roughBtn.Enabled = metBtn.Enabled = opqBtn.Enabled = en;
-            if (!en)
-            {
-                var grey = Color.FromArgb(215, 215, 215);
-                colBtn.BackColor = nrmBtn.BackColor = specBtn.BackColor =
-                roughBtn.BackColor = metBtn.BackColor = opqBtn.BackColor = grey;
-            }
+            roughBtn.Enabled = metBtn.Enabled = opqBtn.Enabled = true;
         }
  
         private void UpdateNoTex()
         {
             if (model == null) { noTexLabel.Visible = false; return; }
-            noTexLabel.Visible = shadeMode == 2 && !model.HasTex(texSlot);
+            noTexLabel.Visible = (shadeMode == 2 || shadeMode == 4) && !model.HasTex(texSlot);
         }
  
         private void UpdateStatLabels()
@@ -1828,7 +1961,7 @@ void main() { FragColor = vec4(color, 1.0); }
         }
  
 // =============================================================================
-//  TEXTURE HOT-RELOAD  (polls LastWriteTime every 500 ms � works with all editors)
+//  TEXTURE HOT-RELOAD  (polls LastWriteTime every 500 ms ? works with all editors)
 // =============================================================================
  
         // Register a path to be polled; call whenever a texture slot is loaded/changed.
@@ -1840,7 +1973,7 @@ void main() { FragColor = vec4(color, 1.0); }
                                   : File.GetLastWriteTimeUtc(path);
         }
  
-        // Runs on the UI thread via the WinForms timer � safe to touch GL here.
+        // Runs on the UI thread via the WinForms timer ? safe to touch GL here.
         private void HotReloadTick(object sender, EventArgs e)
         {
             if (model == null) return;
@@ -2968,7 +3101,7 @@ void main() { FragColor = vec4(color, 1.0); }
     }
  
     // --------------------------------------------------------------------------
-    // MDL  Valve GoldSrc (Half-Life 1) compiled model  � geometry only
+    // MDL  Valve GoldSrc (Half-Life 1) compiled model  ? geometry only
     // --------------------------------------------------------------------------
     public static class MdlLoader
     {
@@ -3540,7 +3673,7 @@ void main() { FragColor = vec4(color, 1.0); }
             Add(chkHdr);
  
             // -- Info tip ----------------------------------------------------
-            Add(new Label { Text = "Z is mirrored  �  V is flipped automatically.",
+            Add(new Label { Text = "Z is mirrored  ?  V is flipped automatically.",
                 Location = new Point(14, sy + 80), Size = new Size(400, 18),
                 ForeColor = Color.FromArgb(110, 110, 110) });
  
