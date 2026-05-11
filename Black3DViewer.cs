@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Drawing;
 using System.IO;
 using System.Text;
@@ -155,7 +156,9 @@ void main()
     vec3 vd     = normalize(viewPos - FragPos);
     vec3 result = shade(lightPos,  vec3(1.0, 1.0, 1.0), norm, vd, albedo, rough, metal, sstr);
  
-    float alpha = (hasOpacityMap != 0) ? texture(opacityMap, TexCoord).r : 1.0;
+    float alpha = (hasOpacityMap != 0) ? texture(opacityMap, TexCoord).r
+              : (hasColorMap    != 0) ? texture(colorMap,    TexCoord).a
+              : 1.0;
     FragColor = vec4(result, alpha);
 }
 ";
@@ -173,7 +176,22 @@ out vec4 FragColor;
 uniform vec3 color;
 void main() { FragColor = vec4(color, 1.0); }
 ";
+        public const string OverlayVert = @"
+#version 330 core
+layout(location = 0) in vec3 aPos;
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+void main() { gl_Position = projection * view * model * vec4(aPos, 1.0); }
+";
+        public const string OverlayFrag = @"
+#version 330 core
+out vec4 FragColor;
+uniform vec4 addColor;
+void main() { FragColor = addColor; }
+";
     }
+ 
  
 // =============================================================================
 //  SECTION 2 - SHADER CLASS
@@ -219,6 +237,7 @@ void main() { FragColor = vec4(color, 1.0); }
         public void SetVec2(string n, Vector2 v)     => GL.Uniform2(Loc(n), v.X, v.Y);
         public void SetVec3(string n, Vector3 v)     => GL.Uniform3(Loc(n), v);
         public void SetMat4(string n, ref Matrix4 m) => GL.UniformMatrix4(Loc(n), false, ref m);
+        public void SetVec4(string n, Vector4 v)     => GL.Uniform4(Loc(n), v.X, v.Y, v.Z, v.W);
     }
  
 // =============================================================================
@@ -231,8 +250,9 @@ void main() { FragColor = vec4(color, 1.0); }
         public int[] TI;   // texcoord indices
         public int[] NI;   // normal indices  (-1 = none)
  
-        public MeshFace(int[] vi, int[] ti, int[] ni)
-        { VI = vi; TI = ti; NI = ni; }
+        public int GrpId;
+        public MeshFace(int[] vi, int[] ti, int[] ni, int grpId=0)
+        { VI = vi; TI = ti; NI = ni; GrpId = grpId; }
     }
  
 // =============================================================================
@@ -351,6 +371,54 @@ void main() { FragColor = vec4(color, 1.0); }
  
         public float   GetSize()   => Math.Max(Math.Max(BoundsMax.X - BoundsMin.X, BoundsMax.Y - BoundsMin.Y), BoundsMax.Z - BoundsMin.Z);
         public Vector3 GetCenter() => (BoundsMin + BoundsMax) * 0.5f;
+        // -- Find geometrically disconnected parts (Union-Find) � for Shift mode --
+        public List<LoosePart> FindLooseParts()
+        {
+            int n=Vertices.Count;
+            if(n==0||Faces.Count==0)return new List<LoosePart>();
+            int[] par=new int[n];for(int i=0;i<n;i++)par[i]=i;
+            Func<int,int> Find=null;
+            Find=(x)=>{while(par[x]!=x){par[x]=par[par[x]];x=par[x];}return x;};
+            Action<int,int> Union=(a,b)=>{int ra=Find(a),rb=Find(b);if(ra!=rb)par[ra]=rb;};
+            var pm=new Dictionary<long,int>(n);
+            for(int i=0;i<n;i++)
+            {
+                var p=Vertices[i];
+                long key=(long)(p.X*1000f)*1000000007L+(long)(p.Y*1000f)*1000003L+(long)(p.Z*1000f);
+                int ex;if(pm.TryGetValue(key,out ex))Union(i,ex);else pm[key]=i;
+            }
+            foreach(var face in Faces)
+                if(face.VI[0]<n&&face.VI[1]<n&&face.VI[2]<n)
+                {Union(face.VI[0],face.VI[1]);Union(face.VI[1],face.VI[2]);}
+            var groups=new Dictionary<int,LoosePart>();
+            for(int fi=0;fi<Faces.Count;fi++)
+            {
+                int vi0=Faces[fi].VI[0];if(vi0>=n)continue;
+                int root=Find(vi0);
+                LoosePart lp;if(!groups.TryGetValue(root,out lp)){lp=new LoosePart();groups[root]=lp;}
+                lp.FaceIndices.Add(fi);
+            }
+            return new List<LoosePart>(groups.Values);
+        }
+ 
+        // -- Find file-defined submeshes (OBJ g/o/usemtl groups) � for Ctrl mode --
+        public List<LoosePart> FindSubmeshes()
+        {
+            var groups=new Dictionary<int,LoosePart>();
+            for(int fi=0;fi<Faces.Count;fi++)
+            {
+                int gid=Faces[fi].GrpId;
+                LoosePart lp;if(!groups.TryGetValue(gid,out lp)){lp=new LoosePart();groups[gid]=lp;}
+                lp.FaceIndices.Add(fi);
+            }
+            // Fallback: if only one group (no g/o tags), split by face material index
+            if(groups.Count<=1) return FindLooseParts();
+            return new List<LoosePart>(groups.Values);
+        }
+ 
+        // Load a texture into GPU and return its ID without assigning to model slots
+        public int LoadTexAndGetId(string path){return LoadTex(path);}
+ 
         public bool    HasTex(int slot)
         {
             switch (slot)
@@ -387,7 +455,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 if (face.VI[0] >= Vertices.Count ||
                     face.VI[1] >= Vertices.Count ||
                     face.VI[2] >= Vertices.Count) continue;
-
+ 
                 var v0 = Vertices[face.VI[0]];
                 var v1 = Vertices[face.VI[1]];
                 var v2 = Vertices[face.VI[2]];
@@ -396,16 +464,17 @@ void main() { FragColor = vec4(color, 1.0); }
                 var fn = Vector3.Cross(e1, e2);
                 if (fn.LengthSquared < 1e-14f) continue;
                 fn.Normalize();
-
+ 
                 // Ensure the normal points away from the model centre.
                 // This corrects inverted winding (e.g. from axis-swap loaders).
                 var faceCenter = (v0 + v1 + v2) * (1f / 3f);
                 if (Vector3.Dot(fn, faceCenter - center) < 0f) fn = -fn;
-
+ 
                 acc[face.VI[0]] += fn;
                 acc[face.VI[1]] += fn;
                 acc[face.VI[2]] += fn;
             }
+            // After recalc, NI must equal VI (one normal per vertex)
             Normals.Clear();
             for (int i = 0; i < acc.Length; i++)
             {
@@ -416,6 +485,12 @@ void main() { FragColor = vec4(color, 1.0); }
             foreach (var face in Faces)
                 for (int j = 0; j < 3; j++)
                     face.NI[j] = face.VI[j];
+        }
+ 
+        public void FlipNormals()
+        {
+            for (int i = 0; i < Normals.Count; i++)
+                Normals[i] = -Normals[i];
         }
  
         // -- Edge counting -----------------------------------------------------
@@ -538,9 +613,9 @@ void main() { FragColor = vec4(color, 1.0); }
             }
         }
  
-        public void LoadTexture(string path, int slot)
+        public int LoadTexture(string path, int slot)
         {
-            int id = LoadTex(path); if (id < 0) return;
+            int id = LoadTex(path); if (id < 0) return -1;
             switch (slot)
             {
                 case 0: ColorMapId    = id; break;
@@ -551,6 +626,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 case 5: OpacityMapId  = id; break;
             }
             if (slot >= 0 && slot < 6) TexPaths[slot] = path;
+            return id;
         }
  
         private int LoadTex(string path)
@@ -771,6 +847,82 @@ void main() { FragColor = vec4(color, 1.0); }
     }
  
 // =============================================================================
+//  SECTION 4b � LOOSE PART / SUBMESH
+// =============================================================================
+    public class LoosePart
+    {
+        public List<int> FaceIndices = new List<int>();
+        public int[]    TexIds   = new int[]    { -1,-1,-1,-1,-1,-1 };
+        public string[] TexPaths = new string[6];
+        public bool     HasTexOverride
+        { get { foreach(var id in TexIds) if(id>=0) return true; return false; } }
+        public int VAO, VBO, EBO; private int _cnt;
+ 
+        public void BuildBuffers(GPUModel src)
+        {
+            if(VAO!=0){GL.DeleteVertexArray(VAO);GL.DeleteBuffer(VBO);GL.DeleteBuffer(EBO);}
+            var vd=new List<float>(); var idx=new List<uint>();
+            foreach(int fi in FaceIndices)
+            {
+                var face=src.Faces[fi];
+                for(int j=0;j<3;j++)
+                {
+                    int vi=Math.Min(face.VI[j],src.Vertices.Count-1);
+                    int ti=face.TI[j]; if(ti<0||ti>=src.TexCoords.Count) ti=-1;
+                    int ni=face.NI[j]; if(ni<0||ni>=src.Normals.Count)   ni=-1;
+                    var p=src.Vertices[vi];
+                    vd.Add(p.X);vd.Add(p.Y);vd.Add(p.Z);
+                    if(ni>=0){var n=src.Normals[ni];  vd.Add(n.X);vd.Add(n.Y);vd.Add(n.Z);}
+                    else     {                         vd.Add(0f); vd.Add(1f); vd.Add(0f);}
+                    if(ti>=0){var u=src.TexCoords[ti];vd.Add(u.X);vd.Add(u.Y);}
+                    else     {                         vd.Add(0f); vd.Add(0f);}
+                    vd.Add(1f);vd.Add(0f);vd.Add(0f);
+                    idx.Add((uint)idx.Count);
+                }
+            }
+            VAO=GL.GenVertexArray();VBO=GL.GenBuffer();EBO=GL.GenBuffer();
+            GL.BindVertexArray(VAO);
+            GL.BindBuffer(BufferTarget.ArrayBuffer,VBO);
+            GL.BufferData(BufferTarget.ArrayBuffer,vd.Count*sizeof(float),vd.ToArray(),BufferUsageHint.StaticDraw);
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer,EBO);
+            GL.BufferData(BufferTarget.ElementArrayBuffer,idx.Count*sizeof(uint),idx.ToArray(),BufferUsageHint.StaticDraw);
+            int st=11*sizeof(float);
+            GL.VertexAttribPointer(0,3,VertexAttribPointerType.Float,false,st,0);               GL.EnableVertexAttribArray(0);
+            GL.VertexAttribPointer(1,3,VertexAttribPointerType.Float,false,st,3*sizeof(float)); GL.EnableVertexAttribArray(1);
+            GL.VertexAttribPointer(2,2,VertexAttribPointerType.Float,false,st,6*sizeof(float)); GL.EnableVertexAttribArray(2);
+            GL.VertexAttribPointer(3,3,VertexAttribPointerType.Float,false,st,8*sizeof(float)); GL.EnableVertexAttribArray(3);
+            GL.BindVertexArray(0);_cnt=idx.Count;
+        }
+        public void Render()
+        { if(VAO==0)return; GL.BindVertexArray(VAO); GL.DrawElements(PrimitiveType.Triangles,_cnt,DrawElementsType.UnsignedInt,0); GL.BindVertexArray(0); }
+        public void Cleanup()
+        { if(VAO!=0){GL.DeleteVertexArray(VAO);GL.DeleteBuffer(VBO);GL.DeleteBuffer(EBO);VAO=VBO=EBO=0;} }
+ 
+        // M�ller�Trumbore ray test
+        public bool HitTest(Vector3 ro, Vector3 rd, GPUModel src, out float tMin)
+        {
+            tMin=float.MaxValue; bool hit=false;
+            foreach(int fi in FaceIndices)
+            {
+                var face=src.Faces[fi];
+                var v0=src.Vertices[Math.Min(face.VI[0],src.Vertices.Count-1)];
+                var v1=src.Vertices[Math.Min(face.VI[1],src.Vertices.Count-1)];
+                var v2=src.Vertices[Math.Min(face.VI[2],src.Vertices.Count-1)];
+                var e1=v1-v0;var e2=v2-v0;
+                var h=Vector3.Cross(rd,e2);float a=Vector3.Dot(e1,h);
+                if(Math.Abs(a)<1e-7f)continue;
+                float f=1f/a;var s=ro-v0;
+                float u=f*Vector3.Dot(s,h);if(u<0f||u>1f)continue;
+                var q=Vector3.Cross(s,e1);float vv=f*Vector3.Dot(rd,q);
+                if(vv<0f||u+vv>1f)continue;
+                float t=f*Vector3.Dot(e2,q);
+                if(t>1e-4f&&t<tMin){tMin=t;hit=true;}
+            }
+            return hit;
+        }
+    }
+ 
+// =============================================================================
 //  SECTION 5 - FORM SETUP & UI CONTROLS
 // =============================================================================
  
@@ -785,7 +937,7 @@ void main() { FragColor = vec4(color, 1.0); }
                      ControlStyles.OptimizedDoubleBuffer, true);
             UpdateStyles();
         }
-        // Don't let WinForms erase the background — our OnPaint covers 100% of pixels.
+        // Don't let WinForms erase the background ? our OnPaint covers 100% of pixels.
         protected override void OnPaintBackground(PaintEventArgs e) { }
     }
  
@@ -834,6 +986,15 @@ void main() { FragColor = vec4(color, 1.0); }
         private int  shadeMode = 0;   // 0=solid 1=wire 2=tex
         private int  texSlot   = 0;
         private bool showUV, showGrid = true, showAxes, showNormals;
+        // -- Loose-parts (Shift) + Submeshes (Ctrl) --------------------------------
+        private List<LoosePart> _looseParts    = new List<LoosePart>(); // Shift: loose parts
+        private List<LoosePart> _submeshes     = new List<LoosePart>(); // Ctrl:  file groups
+        private HashSet<int>    _selectedParts  = new HashSet<int>();   // Shift-selected (for P/J)
+        private HashSet<int>    _separatedParts = new HashSet<int>();   // after P key
+        private int             _hoveredLoose   = -1;  // loose part under mouse (Shift mode)
+        private int             _hoveredSub     = -1;  // submesh under mouse (Ctrl mode)
+        private int             _activeSubmesh  = -1;  // Ctrl-clicked submesh ? receives textures
+        private Shader          _overlayShader;
         private bool darkTheme = false;   // false = light (default), true = dark
         private Vector3 cachedCenter = Vector3.Zero;
         private float   cachedSize   = 5f;
@@ -951,7 +1112,7 @@ void main() { FragColor = vec4(color, 1.0); }
             lightPanel.MouseUp   += (s, e) =>   dragLight = false;
             lightPanel.MouseMove += (s, e) => { if (dragLight) UpdateLight(e.Location); };
             envLightTab.Controls.Add(lightPanel);
-
+ 
             // --- Stats & Shading tab ---
             statsShadingTab = new TabPage("Stats & Shading") { BackColor = BG };
             tabControl.TabPages.Add(statsShadingTab);
@@ -983,7 +1144,7 @@ void main() { FragColor = vec4(color, 1.0); }
             y += 8;
  
             // Texture maps group
-            var grp = new GroupBox { Text = "Texture Maps", Location = new Point(10, y), Size = new Size(270, 186), BackColor = BG };
+            var grp = new GroupBox { Text = "Texture Maps", Location = new Point(10, y), Size = new Size(270, 186), BackColor = BG, Font = new Font("Segoe UI", 10, FontStyle.Bold) };
             statsShadingTab.Controls.Add(grp);
             int gy = 22;
             colBtn  = TBtn(grp, "Color",    ref gy); colBtn.BackColor = PRESS;
@@ -1069,7 +1230,9 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private Button TBtn(Control p, string txt, ref int y)
         {
-            var b = Btn(p, txt, 8, y, 254, 22); y += 26; return b;
+            var b = Btn(p, txt, 8, y, 254, 22); y += 26;
+            b.Font = new Font("Segoe UI", 9f);  // override GroupBox bold inheritance
+            return b;
         }
  
         private Label Lbl(string txt, int x, ref int y)
@@ -1130,6 +1293,7 @@ void main() { FragColor = vec4(color, 1.0); }
             _hotReloadTimer = new System.Windows.Forms.Timer { Interval = 500 };
             _hotReloadTimer.Tick += HotReloadTick;
             _hotReloadTimer.Start();
+            _overlayShader = new Shader(ShaderSource.OverlayVert, ShaderSource.OverlayFrag);
         }
  
         private void BuildCubeGPU()
@@ -1202,7 +1366,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetMat4("projection", ref proj);
                 wireShader.SetMat4("view",       ref view);
                 wireShader.SetMat4("model",      ref modelMat);
-
+ 
                 // --- Solid fill pass ---
                 // Push the filled surface slightly back in depth so the line pass
                 // always wins the depth test and every edge stays fully visible.
@@ -1214,7 +1378,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 DrawMesh();
                 GL.Disable(EnableCap.PolygonOffsetFill);
                 GL.PolygonOffset(0f, 0f);
-
+ 
                 // --- Line pass (edges) ---
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Line);
                 GL.LineWidth(2.2f);
@@ -1251,8 +1415,8 @@ void main() { FragColor = vec4(color, 1.0); }
                     int renderMode = showNormals ? 3 : shadeMode;
                     // For flat-slot mode (4) with no texture, use a colour that clearly
                     // contrasts the background so the model is always visible:
-                    //   Light mode bg ≈ 0.867  →  #2E2E2E (very dark)
-                    //   Dark  mode bg ≈ 0.18   →  #DDDDDD (very light)
+                    //   Light mode bg ? 0.867  ?  #2E2E2E (very dark)
+                    //   Dark  mode bg ? 0.18   ?  #DDDDDD (very light)
                     // All other modes use the standard grey so Solid shading is unchanged.
                     Vector3 sc = (renderMode == 4)
                         ? (_themeT < 0.5f
@@ -1271,7 +1435,7 @@ void main() { FragColor = vec4(color, 1.0); }
                 wireShader.SetMat4("view",       ref view);
                 wireShader.SetMat4("model",      ref modelMat);
                 GL.PolygonMode(MaterialFace.FrontAndBack, PolygonMode.Fill);
-
+ 
                 // ---- Grid (thin GL_LINES, unchanged) ----
                 if (showGrid)
                 {
@@ -1298,15 +1462,15 @@ void main() { FragColor = vec4(color, 1.0); }
                     GL.BindVertexArray(0);
                     GL.DeleteVertexArray(gVAO); GL.DeleteBuffer(gVBO);
                 }
-
+ 
                 // ---- Axes (cross-section prism geometry, GL_TRIANGLES) ----
                 // Each axis = 2 flat quads perpendicular to each other forming a "+" cross-section.
                 // This is real 3D geometry so thickness is guaranteed on every driver.
                 if (showAxes)
                 {
                     float al = Math.Max(cachedSize * 0.12f, 0.5f);
-                    float t  = Math.Max(al * 0.02f, 0.004f); // half-thickness — slim but visible
-
+                    float t  = Math.Max(al * 0.02f, 0.004f); // half-thickness ? slim but visible
+ 
                     var av = new List<float>();
                     // Adds a flat quad (p0,p1,p2,p3 in order) as 2 triangles
                     Action<float,float,float, float,float,float,
@@ -1316,17 +1480,17 @@ void main() { FragColor = vec4(color, 1.0); }
                         av.AddRange(new[]{ x0,y0,z0, x1,y1,z1, x2,y2,z2 });
                         av.AddRange(new[]{ x0,y0,z0, x2,y2,z2, x3,y3,z3 });
                     };
-
-                    // X axis (0→al along X): quad in XY plane + quad in XZ plane
+ 
+                    // X axis (0?al along X): quad in XY plane + quad in XZ plane
                     quad(0,-t,0,  0,t,0,  al,t,0,  al,-t,0);
                     quad(0,0,-t,  0,0,t,  al,0,t,  al,0,-t);
-                    // Y axis (0→al along Y): quad in YX plane + quad in YZ plane
+                    // Y axis (0?al along Y): quad in YX plane + quad in YZ plane
                     quad(-t,0,0,  t,0,0,  t,al,0,  -t,al,0);
                     quad(0,0,-t,  0,0,t,  0,al,t,  0,al,-t);
-                    // Z axis (0→al along Z): quad in ZX plane + quad in ZY plane
+                    // Z axis (0?al along Z): quad in ZX plane + quad in ZY plane
                     quad(-t,0,0,  t,0,0,  t,0,al,  -t,0,al);
                     quad(0,-t,0,  0,t,0,  0,t,al,  0,-t,al);
-
+ 
                     float[] ava = av.ToArray();
                     int aVAO = GL.GenVertexArray(), aVBO = GL.GenBuffer();
                     GL.BindVertexArray(aVAO);
@@ -1334,14 +1498,101 @@ void main() { FragColor = vec4(color, 1.0); }
                     GL.BufferData(BufferTarget.ArrayBuffer, ava.Length * sizeof(float), ava, BufferUsageHint.StreamDraw);
                     GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, 3*sizeof(float), 0);
                     GL.EnableVertexAttribArray(0);
-
+ 
                     GL.Disable(EnableCap.CullFace); // render both faces of each quad
                     wireShader.SetVec3("color", new Vector3(0.9f,  0.15f, 0.15f)); GL.DrawArrays(PrimitiveType.Triangles, 0,  12); // X red
                     wireShader.SetVec3("color", new Vector3(0.15f, 0.85f, 0.15f)); GL.DrawArrays(PrimitiveType.Triangles, 12, 12); // Y green
                     wireShader.SetVec3("color", new Vector3(0.15f, 0.4f,  0.95f)); GL.DrawArrays(PrimitiveType.Triangles, 24, 12); // Z blue
-
+ 
                     GL.BindVertexArray(0);
                     GL.DeleteVertexArray(aVAO); GL.DeleteBuffer(aVBO);
+                }
+            }
+ 
+            // -- A) Custom-texture parts � re-render over main pass ------------------
+            if (model != null && !showCube && shadeMode != 1)
+            {
+                string[] _txU={"colorMap","normalMap","specularMap","roughnessMap","metallicMap","opacityMap"};
+                string[] _hxU={"hasColorMap","hasNormalMap","hasSpecularMap","hasRoughnessMap","hasMetallicMap","hasOpacityMap"};
+                bool _hasCTex=false;
+                for(int _ci=0;_ci<_submeshes.Count;_ci++) if(_submeshes[_ci].HasTexOverride){_hasCTex=true;break;}
+                if(_hasCTex)
+                {
+                    GL.Disable(EnableCap.Blend);
+                    mainShader.Use();
+                    mainShader.SetMat4("projection",ref proj);
+                    mainShader.SetMat4("view",ref view);
+                    mainShader.SetMat4("model",ref modelMat);
+                    GL.DepthFunc(DepthFunction.Lequal);
+                    for(int _ci=0;_ci<_submeshes.Count;_ci++)
+                    {
+                        var _clp=_submeshes[_ci]; if(!_clp.HasTexOverride)continue;
+                        mainShader.SetInt("shadingMode",showNormals?3:shadeMode);
+                        mainShader.SetInt("shadingFlatSlot",texSlot);
+                        mainShader.SetVec3("solidColor",new Vector3(0.86f,0.86f,0.86f));
+                        for(int _ts=0;_ts<6;_ts++)
+                        {
+                            GL.ActiveTexture(TextureUnit.Texture0+_ts);
+                            int _tid=_clp.TexIds[_ts];
+                            GL.BindTexture(TextureTarget.Texture2D,_tid>=0?_tid:0);
+                            mainShader.SetInt(_txU[_ts],_ts);
+                            mainShader.SetInt(_hxU[_ts],_tid>=0?1:0);
+                        }
+                        _clp.Render();
+                    }
+                    GL.DepthFunc(DepthFunction.Less);
+                }
+            }
+ 
+            // -- B) Additive overlay � only while Shift or Ctrl is physically held ----
+            // Z-fighting eliminated: overlay uses a shell matrix scaled 1.003� outward
+            {
+                bool _ovS = (Control.ModifierKeys & Keys.Shift)   != 0;
+                bool _ovC = (Control.ModifierKeys & Keys.Control) != 0;
+                bool _needOv = (_ovS && _hoveredLoose >= 0) || (_ovC && _hoveredSub >= 0)
+                            || (_ovS && _selectedParts.Count > 0);
+                if (_needOv && model != null && !showCube)
+                {
+                    // Scale the shell outward from the model's own centre so the
+                    // overlay sits exactly on top of the geometry regardless of where
+                    // the model lives in world space (avoids the upward-offset bug).
+                    var _sc = cachedCenter;
+                    var _shellMat = Matrix4.CreateTranslation(_sc)
+                                 * Matrix4.CreateScale(1.003f)
+                                 * Matrix4.CreateTranslation(-_sc);
+                    _overlayShader.Use();
+                    _overlayShader.SetMat4("projection", ref proj);
+                    _overlayShader.SetMat4("view",       ref view);
+                    _overlayShader.SetMat4("model",      ref _shellMat);
+                    GL.Enable(EnableCap.Blend);
+                    GL.BlendFunc(BlendingFactor.One, BlendingFactor.One);
+                    GL.DepthMask(false);
+ 
+                    // Ctrl mode: highlight hovered submesh R+12 G+12 B+12
+                    if (_ovC && _hoveredSub >= 0 && _hoveredSub < _submeshes.Count)
+                    {
+                        _overlayShader.SetVec4("addColor", new Vector4(12f/255f,12f/255f,12f/255f,1f));
+                        _submeshes[_hoveredSub].Render();
+                    }
+ 
+                    // Shift mode: highlight hovered loose part + selected parts
+                    if (_ovS)
+                    {
+                        if (_hoveredLoose >= 0 && _hoveredLoose < _looseParts.Count)
+                        {
+                            _overlayShader.SetVec4("addColor", new Vector4(76f/255f,76f/255f,0f/255f,1f));
+                            _looseParts[_hoveredLoose].Render();
+                        }
+                        foreach (int _si in _selectedParts)
+                            if (_si < _looseParts.Count && _si != _hoveredLoose)
+                            {
+                                _overlayShader.SetVec4("addColor", new Vector4(38f/255f,38f/255f,0f/255f,1f));
+                                _looseParts[_si].Render();
+                            }
+                    }
+ 
+                    GL.DepthMask(true);
+                    GL.Disable(EnableCap.Blend);
                 }
             }
  
@@ -1373,34 +1624,50 @@ void main() { FragColor = vec4(color, 1.0); }
             var g  = e.Graphics;
             int pw = previewPanel.Width, ph = previewPanel.Height;
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-
-            // ── Always draw the UV-space background (dark + 4-quadrant grid) ──
+ 
+            // -- Always draw the UV-space background (dark + 4-quadrant grid) --
             g.Clear(Color.FromArgb(30, 30, 30));
             float uvSize  = Math.Min(pw, ph);
             float originX = (pw - uvSize) * 0.5f;
             float originY = (ph - uvSize) * 0.5f;
-
-            // 4-section dividers (halves, not quarters)
-            using (var gp = new Pen(Color.FromArgb(72, 72, 72), 1f))
+ 
+            // 8�8 grid (7 inner lines each axis)
+            using (var gpMn = new Pen(Color.FromArgb(50, 50, 50), 1f))
+            using (var gpMj = new Pen(Color.FromArgb(78, 78, 78), 1f))
             {
-                float midX = originX + uvSize * 1f;
-                float midY = originY + uvSize * 1f;
-                g.DrawLine(gp, midX, originY, midX, originY + uvSize);   // vertical centre
-                g.DrawLine(gp, originX, midY, originX + uvSize, midY);   // horizontal centre
+                for (int _gi = 1; _gi < 8; _gi++)
+                {
+                    float gx = originX + uvSize * _gi / 8f;
+                    float gy = originY + uvSize * _gi / 8f;
+                    var   gp = (_gi == 4) ? gpMj : gpMn;
+                    g.DrawLine(gp, gx, originY, gx, originY + uvSize);
+                    g.DrawLine(gp, originX, gy, originX + uvSize, gy);
+                }
             }
             // UV-space boundary
             using (var bp = new Pen(Color.FromArgb(100, 100, 100), 1f))
                 g.DrawRectangle(bp, originX, originY, uvSize - 1f, uvSize - 1f);
-
+ 
             if (model == null)
             {
                 using (var f = new Font("Segoe UI", 9))
                     g.DrawString("No model loaded", f, Brushes.Gray, originX + 8, originY + 8);
                 return;
             }
-
-            // ── Layer 1: texture for selected slot (covers the grid when loaded) ──
-            Bitmap slotBmp = GetOrLoadSlotBitmap(texSlot);
+ 
+            // -- Layer 1: texture for selected slot (covers the grid when loaded) --
+            // When a submesh is active (Ctrl+click), show that submesh's own texture.
+            Bitmap slotBmp;
+            Bitmap _partBmp = null;  // disposable temp created for submesh path
+            if (_activeSubmesh >= 0 && _activeSubmesh < _submeshes.Count)
+            {
+                _partBmp = GetOrLoadSlotBitmapFromPart(_submeshes[_activeSubmesh], texSlot);
+                slotBmp  = _partBmp ?? GetOrLoadSlotBitmap(texSlot);
+            }
+            else
+            {
+                slotBmp = GetOrLoadSlotBitmap(texSlot);
+            }
             if (slotBmp != null)
             {
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
@@ -1411,8 +1678,9 @@ void main() { FragColor = vec4(color, 1.0); }
                 using (var f = new Font("Segoe UI", 9))
                     g.DrawString("No texture loaded", f, Brushes.Gray, originX + 8, originY + 8);
             }
-
-            // ── Layer 2: UV wireframe edges (only when Show UV Map is active) ──
+            _partBmp?.Dispose(); // temp bitmap used only for this paint cycle
+ 
+            // -- Layer 2: UV wireframe edges (only when Show UV Map is active) --
             if (_uvT > 0.005f && model.TexCoords.Count > 0)
             {
                 if (uvDirty || uvCache == null) { RebuildUVCache(); uvDirty = false; }
@@ -1433,24 +1701,32 @@ void main() { FragColor = vec4(color, 1.0); }
             uvCache?.Dispose(); uvCache = null;
             int pw = previewPanel.Width, ph = previewPanel.Height;
             if (pw <= 2 || ph <= 2 || model == null) return;
-
-            // Transparent background — only the orange UV edge lines are stored here.
+ 
+            // Transparent background ? only the orange UV edge lines are stored here.
             // The dark background + 4-box grid are drawn directly in OnUVPaint every frame.
             var bmp = new Bitmap(pw, ph, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
-
+ 
                 float uvSize  = Math.Min(pw, ph);
                 float originX = (pw - uvSize) * 0.5f;
                 float originY = (ph - uvSize) * 0.5f;
-
-                // UV edges — classic orange
+ 
+                // UV edges: when a submesh is active show only its faces; otherwise all.
+                IEnumerable<MeshFace> _uvFaces;
+                if (_activeSubmesh >= 0 && _activeSubmesh < _submeshes.Count)
+                    _uvFaces = _submeshes[_activeSubmesh].FaceIndices
+                                   .Where(fi => fi >= 0 && fi < model.Faces.Count)
+                                   .Select(fi => model.Faces[fi]);
+                else
+                    _uvFaces = model.Faces;
+ 
                 using (var pen = new Pen(Color.FromArgb(255, 165, 0), 1f))
                 {
                     var drawn = new HashSet<long>();
-                    foreach (var face in model.Faces)
+                    foreach (var face in _uvFaces)
                         for (int i = 0; i < face.TI.Length; i++)
                         {
                             int a = face.TI[i], b = face.TI[(i + 1) % face.TI.Length];
@@ -1515,6 +1791,27 @@ void main() { FragColor = vec4(color, 1.0); }
             catch { return null; }
         }
  
+        // Load a preview bitmap directly from a LoosePart's own texture path.
+        // Not cached in _slotBmps (which belongs to the whole-model textures);
+        // result is thrown away after each paint and re-loaded lazily.
+        private Bitmap GetOrLoadSlotBitmapFromPart(LoosePart part, int slot)
+        {
+            if (part == null || slot < 0 || slot >= 6) return null;
+            // Prefer the part's own override; fall back to the model's path.
+            string path = part.TexPaths[slot];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+                path = model?.TexPaths[slot];
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
+            try
+            {
+                string ext = Path.GetExtension(path).ToLowerInvariant();
+                if (ext == ".dds") return model.LoadDDSPublic(path);
+                if (ext == ".tga") return model.LoadTGAPublic(path);
+                return new Bitmap(path);
+            }
+            catch { return null; }
+        }
+ 
         private void ClearSlotBmps()
         {
             for (int i = 0; i < 6; i++) { _slotBmps[i]?.Dispose(); _slotBmps[i] = null; }
@@ -1541,6 +1838,44 @@ void main() { FragColor = vec4(color, 1.0); }
             if      (e.KeyCode == Keys.R) { ResetCam();    e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.F) { FocusModel();  e.Handled = e.SuppressKeyPress = true; }
             else if (e.KeyCode == Keys.M) { ToggleTheme(); e.Handled = e.SuppressKeyPress = true; }
+            // P � Separate Shift-selected loose parts
+            else if (e.KeyCode == Keys.P && _selectedParts.Count > 0)
+            {
+                foreach(int i in _selectedParts) _separatedParts.Add(i);
+                _selectedParts.Clear(); glControl.Invalidate();
+                e.Handled = e.SuppressKeyPress = true;
+            }
+            // Ctrl+J � Rejoin selected separated loose parts
+            else if (e.KeyCode == Keys.J && (e.Modifiers & Keys.Control) != 0)
+            {
+                foreach(int i in new List<int>(_selectedParts))
+                {
+                    _separatedParts.Remove(i);
+                    if(i<_looseParts.Count)
+                        for(int s=0;s<6;s++){_looseParts[i].TexIds[s]=-1;_looseParts[i].TexPaths[s]=null;}
+                }
+                _selectedParts.Clear(); glControl.Invalidate();
+                e.Handled = e.SuppressKeyPress = true;
+            }
+            // Ctrl+N � Flip normals
+            else if (e.KeyCode == Keys.N && (e.Modifiers & Keys.Control) != 0 && model != null)
+            {
+                model.FlipNormals();
+                glControl.MakeCurrent(); model.BuildBuffers();
+                foreach(var lp in _looseParts) lp.BuildBuffers(model);
+                foreach(var sm in _submeshes)   sm.BuildBuffers(model);
+                glControl.Invalidate(); e.Handled = e.SuppressKeyPress = true;
+            }
+            // N � Smooth normal recalculation
+            else if (e.KeyCode == Keys.N && (e.Modifiers & Keys.Control) == 0 && model != null)
+            {
+                model.RecalcNormals();
+                glControl.MakeCurrent(); model.BuildBuffers();
+                foreach(var lp in _looseParts) lp.BuildBuffers(model);
+                foreach(var sm in _submeshes)   sm.BuildBuffers(model);
+                glControl.Invalidate(); e.Handled = e.SuppressKeyPress = true;
+            }
+ 
         }
  
         private void FocusModel()
@@ -1550,7 +1885,6 @@ void main() { FragColor = vec4(color, 1.0); }
             cachedSize   = model.GetSize();
             lookAt       = cachedCenter;
             zoom         = -cachedSize * 1.8f;
-            rotX = 0f; rotY = 0f;
             glControl.Invalidate();
         }
  
@@ -1681,7 +2015,6 @@ void main() { FragColor = vec4(color, 1.0); }
                 zoom        = -cachedSize * 1.8f;
             }
             else { zoom = -5f; lookAt = Vector3.Zero; }
-            rotX = 0f; rotY = 0f;
             glControl.Invalidate();
         }
  
@@ -1689,13 +2022,98 @@ void main() { FragColor = vec4(color, 1.0); }
         {
             if (e.Button == MouseButtons.Left)
             {
-                if ((DateTime.Now - lastClick).TotalMilliseconds < 300) ResetCam();
+                bool ctrl  = (Control.ModifierKeys & Keys.Control) != 0;
+                bool shift = (Control.ModifierKeys & Keys.Shift)   != 0;
+ 
+                if (ctrl && model != null && !showCube && _hoveredSub >= 0)
+                {
+                    // Ctrl+Click: select/deselect submesh for texture assignment
+                    _activeSubmesh = (_activeSubmesh == _hoveredSub) ? -1 : _hoveredSub;
+                    uvDirty = true; previewPanel.Invalidate();
+                    glControl.Invalidate(); return;
+                }
+                if (shift && model != null && !showCube && _hoveredLoose >= 0)
+                {
+                    // Shift+Click: toggle loose part in separation selection
+                    if (_selectedParts.Contains(_hoveredLoose)) _selectedParts.Remove(_hoveredLoose);
+                    else _selectedParts.Add(_hoveredLoose);
+                    glControl.Invalidate(); return;
+                }
+ 
+                if ((DateTime.Now - lastClick).TotalMilliseconds < 300
+                    && RayHitsModel(e.Location)) FocusModel();
                 dragRot = true; lastMouse = e.Location; lastClick = DateTime.Now;
             }
             else if (e.Button == MouseButtons.Right)
             { dragPan = true; lastMouse = e.Location; }
             else if (e.Button == MouseButtons.Middle)
             { dragZoomMid = true; lastMouse = e.Location; }
+        }
+ 
+        // Ray-AABB test: returns true if the ray from mouse hits the loaded model bounds
+        private bool RayHitsModel(Point mouse)
+        {
+            if (model == null) return false;
+            float aspect = (float)glControl.Width / Math.Max(glControl.Height, 1);
+            var proj = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f), aspect, 0.01f, 5000f);
+            float dist = Math.Abs(zoom);
+            float rX = MathHelper.DegreesToRadians(rotX), rY = MathHelper.DegreesToRadians(rotY);
+            var cam = lookAt + new Vector3(dist * (float)(Math.Sin(rY) * Math.Cos(rX)),
+                                           dist * (float)Math.Sin(rX),
+                                           dist * (float)(Math.Cos(rY) * Math.Cos(rX)));
+            var view = Matrix4.LookAt(cam, lookAt, Vector3.UnitY);
+            float nx = (2f * mouse.X) / glControl.Width - 1f;
+            float ny = -(2f * mouse.Y) / glControl.Height + 1f;
+            var eye4 = Vector4.Transform(new Vector4(nx, ny, -1f, 1f), Matrix4.Invert(proj));
+            eye4 = new Vector4(eye4.X, eye4.Y, -1f, 0f);
+            var w4 = Vector4.Transform(eye4, Matrix4.Invert(view));
+            var rd = new Vector3(w4.X, w4.Y, w4.Z);
+            if (rd.LengthSquared < 1e-10f) return false;
+            rd.Normalize();
+            // Slab AABB test against model bounds
+            float[] ro = { cam.X, cam.Y, cam.Z };
+            float[] rd3 = { rd.X, rd.Y, rd.Z };
+            float[] bMin = { model.BoundsMin.X, model.BoundsMin.Y, model.BoundsMin.Z };
+            float[] bMax = { model.BoundsMax.X, model.BoundsMax.Y, model.BoundsMax.Z };
+            float tMin = float.NegativeInfinity, tMax = float.PositiveInfinity;
+            for (int a = 0; a < 3; a++)
+            {
+                if (Math.Abs(rd3[a]) < 1e-8f)
+                { if (ro[a] < bMin[a] || ro[a] > bMax[a]) return false; }
+                else
+                {
+                    float t1 = (bMin[a] - ro[a]) / rd3[a];
+                    float t2 = (bMax[a] - ro[a]) / rd3[a];
+                    if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+                    tMin = Math.Max(tMin, t1);
+                    tMax = Math.Min(tMax, t2);
+                    if (tMin > tMax) return false;
+                }
+            }
+            return tMax > 0f;
+        }
+ 
+        // Generic ray-pick into any LoosePart list; returns index or -1
+        private int PickFrom(List<LoosePart> parts, Point mouse)
+        {
+            float aspect=(float)glControl.Width/Math.Max(glControl.Height,1);
+            var proj=Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f),aspect,0.01f,5000f);
+            float dist=Math.Abs(zoom);
+            float rX=MathHelper.DegreesToRadians(rotX),rY=MathHelper.DegreesToRadians(rotY);
+            var cam=lookAt+new Vector3(dist*(float)(Math.Sin(rY)*Math.Cos(rX)),
+                                       dist*(float) Math.Sin(rX),
+                                       dist*(float)(Math.Cos(rY)*Math.Cos(rX)));
+            var view=Matrix4.LookAt(cam,lookAt,Vector3.UnitY);
+            float nx=(2f*mouse.X)/glControl.Width-1f, ny=-(2f*mouse.Y)/glControl.Height+1f;
+            var eye4=Vector4.Transform(new Vector4(nx,ny,-1f,1f),Matrix4.Invert(proj));
+            eye4=new Vector4(eye4.X,eye4.Y,-1f,0f);
+            var w4=Vector4.Transform(eye4,Matrix4.Invert(view));
+            var rd=new Vector3(w4.X,w4.Y,w4.Z);
+            if(rd.LengthSquared<1e-10f)return -1; rd.Normalize();
+            int best=-1; float bestT=float.MaxValue;
+            for(int i=0;i<parts.Count;i++)
+            { float t; if(parts[i].HitTest(cam,rd,model,out t)&&t<bestT){bestT=t;best=i;} }
+            return best;
         }
  
         private void OnMouseUp(object sender, MouseEventArgs e)
@@ -1707,6 +2125,27 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void OnMouseMove(object sender, MouseEventArgs e)
         {
+            bool _mmC=(Control.ModifierKeys & Keys.Control)!=0;
+            bool _mmS=(Control.ModifierKeys & Keys.Shift)  !=0;
+            if (!dragRot && !dragPan && !dragZoomMid && model != null && !showCube)
+            {
+                if (_mmC && _submeshes.Count > 0)
+                {
+                    int np=PickFrom(_submeshes,e.Location);
+                    if(np!=_hoveredSub){_hoveredSub=np;glControl.Invalidate();}
+                }
+                else if (!_mmC && _hoveredSub != -1)
+                { _hoveredSub=-1; glControl.Invalidate(); }
+ 
+                if (_mmS && _looseParts.Count > 0)
+                {
+                    int np=PickFrom(_looseParts,e.Location);
+                    if(np!=_hoveredLoose){_hoveredLoose=np;glControl.Invalidate();}
+                }
+                else if (!_mmS && _hoveredLoose != -1)
+                { _hoveredLoose=-1; glControl.Invalidate(); }
+            }
+ 
             if (dragRot)
             {
                 // FIX: negate X delta ? dragging right rotates scene rightward (natural)
@@ -1762,7 +2201,7 @@ void main() { FragColor = vec4(color, 1.0); }
             // Match the surrounding tab background so the panel has no visible box
             g.Clear(BG);
             int cx = lightPanel.Width / 2, cy = lightPanel.Height / 2, r = 70;
-            // Circle outline only (no fill – much faster)
+            // Circle outline only (no fill ? much faster)
             using (var pen = new Pen(Color.FromArgb(190, 190, 190), 1.5f))
                 g.DrawEllipse(pen, cx - r, cy - r, r * 2, r * 2);
             // Gold ball at current light angle
@@ -1849,6 +2288,16 @@ void main() { FragColor = vec4(color, 1.0); }
             for (int ws = 0; ws < 6; ws++)
                 TrackTexture(ws, model.TexPaths[ws]);
  
+            glControl.MakeCurrent();
+            _selectedParts.Clear(); _separatedParts.Clear();
+            _hoveredLoose=-1; _hoveredSub=-1; _activeSubmesh=-1;
+            foreach(var lp in _looseParts) lp.Cleanup();
+            foreach(var sm in _submeshes)   sm.Cleanup();
+            _looseParts = model.FindLooseParts();
+            _submeshes  = model.FindSubmeshes();
+            foreach(var lp in _looseParts) lp.BuildBuffers(model);
+            foreach(var sm in _submeshes)   sm.BuildBuffers(model);
+ 
             previewPanel.Invalidate();
             glControl.Invalidate();
         }
@@ -1864,10 +2313,21 @@ void main() { FragColor = vec4(color, 1.0); }
             {
                 // Always load a dropped texture into the Color slot and show it immediately
                 glControl.MakeCurrent();
-                model.LoadTexture(f, 0);
-                TrackTexture(0, f);
-                _slotBmps[0]?.Dispose(); _slotBmps[0] = null;
-                SetSlot(0);   // switches to flat Color-slot view instantly
+                if (_activeSubmesh >= 0 && _activeSubmesh < _submeshes.Count)
+                {
+                    // Assign to Ctrl-selected submesh only
+                    var _alp=_submeshes[_activeSubmesh];
+                    if(_alp.TexIds[0]>=0) GL.DeleteTexture(_alp.TexIds[0]);
+                    _alp.TexIds[0]=model.LoadTexAndGetId(f);
+                    _alp.TexPaths[0]=f;
+                }
+                else
+                {
+                    model.LoadTexture(f, 0);
+                    TrackTexture(0, f);
+                    _slotBmps[0]?.Dispose(); _slotBmps[0] = null;
+                    SetSlot(0);
+                }   // switches to flat Color-slot view instantly
                 previewPanel.Invalidate();
                 glControl.Invalidate();
             }
@@ -1886,7 +2346,7 @@ void main() { FragColor = vec4(color, 1.0); }
             RefreshShade();      // sync shading-button highlights (texBtn deselected, etc.)
             UpdateNoTex();
             uvDirty = true;
-            // Instant — no fade animation
+            // Instant ? no fade animation
             _texAlpha  = (model != null && !string.IsNullOrEmpty(model.TexPaths[s])) ? 1f : 0f;
             _texTarget = _texAlpha;
             previewPanel.Invalidate();
@@ -1921,7 +2381,7 @@ void main() { FragColor = vec4(color, 1.0); }
  
         private void RefreshTexBtnEnabled()
         {
-            // Buttons are always enabled — never gray them out
+            // Buttons are always enabled ? never gray them out
             colBtn.Enabled = nrmBtn.Enabled = specBtn.Enabled =
             roughBtn.Enabled = metBtn.Enabled = opqBtn.Enabled = true;
         }
@@ -1956,7 +2416,9 @@ void main() { FragColor = vec4(color, 1.0); }
             model?.Cleanup();
             uvCache?.Dispose();
             _checkerBmp?.Dispose(); ClearSlotBmps();
-            if (cubeVAO != 0) GL.DeleteVertexArray(cubeVAO);
+            foreach(var lp in _looseParts) lp.Cleanup();
+            foreach(var sm in _submeshes) sm.Cleanup();
+                        if (cubeVAO != 0) GL.DeleteVertexArray(cubeVAO);
             if (cubeVBO != 0) GL.DeleteBuffer(cubeVBO);
         }
  
@@ -2030,6 +2492,7 @@ void main() { FragColor = vec4(color, 1.0); }
             var uvs    = new List<Vector2>();
             var norms  = new List<Vector3>();
             var faces  = new List<MeshFace>();
+            int _grpId = 0;
             var bMin   = new Vector3( float.MaxValue,  float.MaxValue,  float.MaxValue);
             var bMax   = new Vector3(-float.MaxValue, -float.MaxValue, -float.MaxValue);
  
@@ -2040,7 +2503,9 @@ void main() { FragColor = vec4(color, 1.0); }
                 var p = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 if (p.Length < 2) continue;
  
-                if (p[0] == "v" && p.Length >= 4)
+                if ((p[0]=="g"||p[0]=="o"||p[0]=="usemtl") && p.Length>=2)
+                    _grpId++;
+                else if (p[0] == "v" && p.Length >= 4)
                 {
                     // Preserve original axis swap from user's code: Y?Z, flip Z
                     // This converts Z-up (NinjaRipper/DX style) to Y-up (OpenGL).
@@ -2069,7 +2534,7 @@ void main() { FragColor = vec4(color, 1.0); }
                         faces.Add(new MeshFace(
                             new[] { vi[0], vi[i], vi[i + 1] },
                             new[] { ti[0], ti[i], ti[i + 1] },
-                            new[] { ni[0], ni[i], ni[i + 1] }));
+                            new[] { ni[0], ni[i], ni[i + 1] }, _grpId));
                 }
             }
             return (verts, uvs, norms, faces, bMin, bMax);
@@ -3734,4 +4199,3 @@ void main() { FragColor = vec4(color, 1.0); }
     }
  
 }  // namespace Viewer3D
- 
